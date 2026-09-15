@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spxlcast"
+version = "0.1.0"
+description = "Fundamentals-driven price distribution forecast, rating and price percentiles for SPXL (3x S&P 500)"
+requires-python = ">=3.10"
+dependencies = [
+    "yfinance>=0.2.50",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "requests>=2.31",
+    "vaderSentiment>=3.3",
+    "rich>=13.0",
+    "matplotlib>=3.8",
+]
+
+[project.scripts]
+spxlcast = "spxlcast.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["spxlcast*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

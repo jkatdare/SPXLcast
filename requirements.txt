@@ -1,0 +1,9 @@
+yfinance>=0.2.50
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+requests>=2.31
+vaderSentiment>=3.3
+rich>=13.0
+matplotlib>=3.8
+pytest>=8.0
