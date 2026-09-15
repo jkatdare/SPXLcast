@@ -3,7 +3,7 @@
 Fundamentals-driven price forecast for **SPXL** (Direxion Daily S&P 500 Bull 3X), with a
 **Buy / Hold / Sell** rating and a **percentile lookup** for any price level.
 
-No technical analysis is used. The forecast is a Monte Carlo distribution of SPXL prices built from:
+The forecast is a Monte Carlo distribution of SPXL prices built from:
 
 * **Valuation of the S&P 500** - earnings yield, dividend yield, long-run earnings growth
 * **Macro conditions** - short and long Treasury yields, real yields, yield-curve slope, credit
