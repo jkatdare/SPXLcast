@@ -20,27 +20,64 @@ from rich.console import Console
 
 from .config import Config
 from .pipeline import forecast_to_dict, run_forecast
-from .report import render_all
+from .report import ordinal, render_all
 
 COMMANDS = ("forecast", "price", "metrics", "news", "calibrate")
+
+
+def _positive_int(text: str) -> int:
+    v = int(text)
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return v
+
+
+def _positive_float(text: str) -> float:
+    v = float(text)
+    if v <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return v
+
+
+def _nonnegative_float(text: str) -> float:
+    v = float(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return v
+
+
+def _drift_float(text: str) -> float:
+    v = float(text)
+    if v <= -1.0 or v > 5.0:
+        raise argparse.ArgumentTypeError("must be an annual return above -100% (e.g. 0.08)")
+    return v
+
+
+def _paths_int(text: str) -> int:
+    v = int(text)
+    if v < 100:
+        raise argparse.ArgumentTypeError("must be at least 100 paths")
+    return v
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--price", type=float, action="append", default=None,
                    help="price level to locate in the distribution (repeatable)")
-    p.add_argument("--horizons", type=int, nargs="+", default=None, help="horizons in trading days (default 21 63 126 252)")
-    p.add_argument("--rating-horizon", type=int, default=None, help="horizon used for the rating (default 126)")
-    p.add_argument("--paths", type=int, default=None, help="Monte Carlo paths (default 20000)")
+    p.add_argument("--horizons", type=_positive_int, nargs="+", default=None, help="horizons in trading days (default 21 63 126 252)")
+    p.add_argument("--rating-horizon", type=_positive_int, default=None, help="horizon used for the rating (default 126)")
+    p.add_argument("--paths", type=_paths_int, default=None, help="Monte Carlo paths (default 50000)")
     p.add_argument("--seed", type=int, default=None, help="random seed (default 42)")
     p.add_argument("--no-news", action="store_true", help="skip news sentiment")
     p.add_argument("--no-fred", action="store_true", help="skip FRED macro series")
-    p.add_argument("--no-macro-adj", action="store_true", help="disable macro adjustments to the index drift")
-    p.add_argument("--refresh", action="store_true", help="ignore the on-disk cache")
-    p.add_argument("--index-drift", type=float, default=None, help="override S&P 500 expected total return, e.g. 0.08")
-    p.add_argument("--vol", type=float, default=None, help="override annualised index vol, e.g. 0.18")
+    p.add_argument("--no-macro-adj", action="store_true", help="disable valuation/regime adjustments to the index drift")
+    p.add_argument("--refresh", action="store_true", help="ignore the on-disk cache (still refreshes it)")
+    p.add_argument("--index-drift", type=_drift_float, default=None, help="override S&P 500 expected total return, e.g. 0.08")
+    p.add_argument("--vol", type=_nonnegative_float, default=None, help="override annualised index vol, e.g. 0.18")
     p.add_argument("--pe", type=float, default=None, help="override trailing P/E of the index")
     p.add_argument("--div-yield", type=float, default=None, help="override dividend yield, e.g. 0.013")
     p.add_argument("--eps-growth", type=float, default=None, help="override long-run nominal EPS growth, e.g. 0.055")
+    p.add_argument("--swap-spread", type=float, default=None, help="override the all-in financing spread, e.g. 0.0075")
+    p.add_argument("--skew", type=_positive_float, default=None, help="daily shock skew gamma (1 = symmetric, default 0.9)")
     p.add_argument("--json", dest="json_path", default=None, help="write the full result to a JSON file")
     p.add_argument("--plot", dest="plot_path", default=None, help="write a fan chart PNG to this path")
     p.add_argument("--quiet", action="store_true", help="only print the rating line")
@@ -64,11 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> Config:
     cfg = Config()
     updates = {}
-    if args.horizons:
+    if args.horizons is not None:
         updates["horizons"] = tuple(sorted(set(args.horizons)))
-    if args.rating_horizon:
+    if args.rating_horizon is not None:
         updates["rating_horizon"] = args.rating_horizon
-    if args.paths:
+    if args.paths is not None:
         updates["n_paths"] = args.paths
     if args.seed is not None:
         updates["seed"] = args.seed
@@ -89,41 +126,56 @@ def config_from_args(args: argparse.Namespace) -> Config:
     if args.div_yield is not None:
         updates["override_dividend_yield"] = args.div_yield
     if args.eps_growth is not None:
-        updates["long_run_eps_growth"] = args.eps_growth
+        updates["override_eps_growth"] = args.eps_growth
+    if args.swap_spread is not None:
+        updates["swap_spread"] = args.swap_spread
+    if args.skew is not None:
+        updates["skew_gamma"] = args.skew
     cfg = replace(cfg, **updates)
     if cfg.rating_horizon not in cfg.horizons:
         cfg = replace(cfg, horizons=tuple(sorted(set(cfg.horizons) | {cfg.rating_horizon})))
     return cfg
 
 
+def _utf8_stdout() -> None:
+    """Windows consoles and redirected output default to cp1252; headlines can contain anything."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0].startswith("-"):
+    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
         argv.insert(0, "forecast")
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
+    _utf8_stdout()
     cfg = config_from_args(args)
     prices: List[float] = list(args.price or [])
     if args.command == "price":
         prices = list(args.prices) + prices
 
     console = Console()
-    if not console.is_terminal:  # piped or captured output: do not squeeze tables into 80 columns
+    if not console.is_terminal or console.width < 110:  # keep tables readable when piped or narrow
         console = Console(width=max(console.width, 120))
     with console.status("Fetching data and simulating...", spinner="dots"):
         fc = run_forecast(cfg)
 
     if args.quiet:
-        console.print(f"{cfg.etf} {fc.spot:,.2f}  rating {fc.rating.label} ({fc.rating.conviction.lower()}, "
-                      f"score {fc.rating.score:+.2f}) over {fc.rating.horizon}d; median {fc.rating.median_return:+.1%}, "
+        console.print(f"{cfg.etf} {fc.spot:,.2f} ({fc.spot_status} {fc.spot_date})  rating {fc.rating.label} "
+                      f"({fc.rating.conviction.lower()}, score {fc.rating.score:+.2f} +/- {fc.rating.score_se:.2f}) "
+                      f"over {fc.rating.horizon}d; median {fc.rating.median_return:+.1%}, mean {fc.rating.mean_return:+.1%}, "
                       f"P(beat T-bill) {fc.rating.p_beat_rf:.0%}")
         for p in prices:
             rows = fc.price_lookup(p)
             r = next(x for x in rows if x["horizon"] == fc.rating.horizon)
-            console.print(f"  price {p:,.2f}: {r['percentile']:.0f}th percentile at {fc.rating.horizon}d, "
-                          f"P(touch at/below) {r['p_touch_below']:.0%}, P(touch at/above) {r['p_touch_above']:.0%}")
+            console.print(f"  price {p:,.2f}: {ordinal(r['percentile'])} percentile at {fc.rating.horizon}d, "
+                          f"P(dips to it) {r['p_touch_below']:.0%}, P(rises to it) {r['p_touch_above']:.0%}")
     else:
         sections = {
             "forecast": None,
@@ -137,7 +189,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.json_path:
         os.makedirs(os.path.dirname(os.path.abspath(args.json_path)), exist_ok=True)
         with open(args.json_path, "w", encoding="utf-8") as fh:
-            json.dump(forecast_to_dict(fc, prices), fh, indent=2, default=str)
+            json.dump(forecast_to_dict(fc, prices), fh, indent=2, default=str, allow_nan=False)
         console.print(f"[dim]wrote {args.json_path}[/dim]")
     if args.plot_path:
         from .plots import save_fan_chart

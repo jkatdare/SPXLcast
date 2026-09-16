@@ -1,13 +1,14 @@
 """Monte Carlo engine: simulate daily S&P 500 total returns, compound them through the
 leveraged-ETF mechanics, and record the terminal, path-minimum and path-maximum prices.
 
-Daily index shocks are Student-t (fat tails) with a deterministic vol term structure and a drift
-that may differ over the first weeks (news sentiment). Simple daily returns are simulated directly
-so that the leveraged fund's compounding drag arises naturally.
+Daily index shocks are skewed Student-t (fat tails, mild negative skew) with a deterministic vol
+term structure and a drift that may differ over the first weeks (news sentiment). Simple daily
+returns are simulated directly so that the leveraged fund's compounding drag arises naturally.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -19,6 +20,31 @@ def standardized_t(rng: np.random.Generator, dof: float, size: int) -> np.ndarra
     """Student-t draws rescaled to unit variance (requires dof > 2)."""
     z = rng.standard_t(dof, size=size)
     return z * np.sqrt((dof - 2.0) / dof)
+
+
+def _abs_moment_t(dof: float) -> float:
+    """E|T| for a unit-variance Student-t with ``dof`` degrees of freedom."""
+    raw = 2.0 * math.sqrt(dof) * math.gamma((dof + 1.0) / 2.0) / ((dof - 1.0) * math.sqrt(math.pi) * math.gamma(dof / 2.0))
+    return raw * math.sqrt((dof - 2.0) / dof)
+
+
+def skewed_standardized_t(rng: np.random.Generator, dof: float, gamma: float, size: int) -> np.ndarray:
+    """Fernandez-Steel skewed Student-t, standardised to zero mean and unit variance.
+
+    ``gamma`` < 1 gives negative skew (larger down moves than up moves), 1.0 is symmetric.
+    A positive draw is scaled by gamma with probability gamma^2/(1+gamma^2), otherwise a negative
+    draw is scaled by 1/gamma.
+    """
+    t = standardized_t(rng, dof, size)
+    if gamma == 1.0:
+        return t
+    a = np.abs(t)
+    pos = rng.random(size) < gamma ** 2 / (1.0 + gamma ** 2)
+    z = np.where(pos, gamma * a, -a / gamma)
+    m1 = _abs_moment_t(dof)
+    mean = m1 * (gamma - 1.0 / gamma)
+    var = (gamma ** 2 - 1.0 + 1.0 / gamma ** 2) - mean ** 2
+    return (z - mean) / math.sqrt(var)
 
 
 def annual_to_daily_drift(mu_annual: np.ndarray | float) -> np.ndarray:
@@ -76,7 +102,7 @@ class SimulationResult:
             "horizon": horizon,
             "mean_return": float(r.mean()),
             "median_return": float(np.median(r)),
-            "std_return": float(r.std(ddof=1)),
+            "std_return": float(r.std(ddof=1)) if len(r) > 1 else 0.0,
             "p_positive": float(np.mean(r > 0)),
             "p_beat_rf": float(np.mean(r > rf)),
             "p_beat_index": float(np.mean(r > idx)),
@@ -101,12 +127,21 @@ def simulate(
     tracking_sd_daily: float,
     rf_annual: float,
     horizons: Sequence[int],
-    n_paths: int = 20_000,
+    n_paths: int = 50_000,
     dof: float = 4.0,
+    skew_gamma: float = 1.0,
     max_daily_move: float = 0.20,
     seed: Optional[int] = 42,
 ) -> SimulationResult:
     horizons = sorted(int(h) for h in horizons)
+    if not horizons or horizons[0] < 1:
+        raise ValueError("horizons must be positive integers")
+    if n_paths < 2:
+        raise ValueError("n_paths must be at least 2")
+    if dof <= 2:
+        raise ValueError("dof must exceed 2 for a finite variance")
+    if skew_gamma <= 0:
+        raise ValueError("skew_gamma must be positive (1 = symmetric)")
     T = max(horizons)
     mu_annual = np.broadcast_to(np.asarray(mu_annual, dtype=float), (T,))
     sigma_annual = np.broadcast_to(np.asarray(sigma_annual, dtype=float), (T,))
@@ -126,7 +161,7 @@ def simulate(
                            index_terminal={}, rf_growth={}, fan=fan, n_paths=n_paths)
     hset = set(horizons)
     for t in range(T):
-        z = standardized_t(rng, dof, n_paths)
+        z = skewed_standardized_t(rng, dof, skew_gamma, n_paths)
         r = mu_d[t] + sig_d[t] * z
         np.clip(r, -max_daily_move, max_daily_move, out=r)
         r_etf = leverage * r - daily_cost

@@ -1,6 +1,7 @@
 """End-to-end pipeline: data -> drivers -> simulation -> rating, plus a JSON-able summary."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -10,9 +11,9 @@ from .config import Config
 from .data import MarketSnapshot, load_market
 from .etf import ETFParams, build_etf_params
 from .fundamentals import (ExpectedReturn, IndexFundamentals, MacroState, Sensitivity, VolTermStructure,
-                           build_fundamentals, build_macro, expected_index_return,
+                           build_fundamentals, build_macro, expected_index_return, expected_inflation,
                            influencer_sensitivities, vol_term_structure)
-from .montecarlo import QUANTILES, SimulationResult, simulate
+from .montecarlo import SimulationResult, simulate
 from .rating import Rating, rate
 from .sentiment import SentimentResult, analyze_news
 
@@ -23,6 +24,7 @@ class Forecast:
     snap: MarketSnapshot
     spot: float
     spot_date: str
+    spot_status: str                      # "close" or "intraday"
     macro: MacroState
     fundamentals: IndexFundamentals
     expected: ExpectedReturn
@@ -70,9 +72,10 @@ def run_forecast(cfg: Config) -> Forecast:
     if spot is None:
         raise RuntimeError(f"No price history for {cfg.etf}; check the network connection")
     spot_date = str(snap.last_date(cfg.etf).date())
+    spot_status = "intraday" if snap.intraday else "close"
 
     macro = build_macro(snap, cfg)
-    fund = build_fundamentals(snap, cfg)
+    fund = build_fundamentals(snap, cfg, inflation=expected_inflation(macro, cfg))
     expected = expected_index_return(fund, macro, cfg)
 
     horizons = sorted(set(int(h) for h in cfg.horizons) | {int(cfg.rating_horizon)})
@@ -83,43 +86,55 @@ def run_forecast(cfg: Config) -> Forecast:
     sentiment = None
     mu = np.full(T, expected.final)
     if cfg.use_news:
-        weights = {}
+        weights, names = {}, {}
         if snap.holdings is not None:
             weights = dict(zip(snap.holdings["symbol"], snap.holdings["weight"]))
-        sentiment = analyze_news(snap.news, cfg, weights, now=snap.asof)
+            names = dict(zip(snap.holdings["symbol"], snap.holdings["name"]))
+        sentiment = analyze_news(snap.news, cfg, weights, now=snap.asof, holdings_names=names)
         n = min(cfg.sentiment_days, T)
         mu[:n] += sentiment.drift_adjustment
 
-    sim = simulate(
-        spot=spot, mu_annual=mu, sigma_annual=vol.daily, leverage=etf.leverage,
-        daily_cost=etf.daily_cost, tracking_sd_daily=etf.tracking_sd_daily, rf_annual=macro.rf_3m,
-        horizons=horizons, n_paths=cfg.n_paths, dof=cfg.t_dof, max_daily_move=cfg.max_daily_move,
-        seed=cfg.seed,
-    )
+    def _simulate(mu_path: np.ndarray) -> SimulationResult:
+        return simulate(
+            spot=spot, mu_annual=mu_path, sigma_annual=vol.daily, leverage=etf.leverage,
+            daily_cost=etf.daily_cost, tracking_sd_daily=etf.tracking_sd_daily, rf_annual=macro.rf_3m,
+            horizons=horizons, n_paths=cfg.n_paths, dof=cfg.t_dof, skew_gamma=cfg.skew_gamma,
+            max_daily_move=cfg.max_daily_move, seed=cfg.seed,
+        )
+
+    sim = _simulate(mu)
+    # The rating is judged on the distribution WITHOUT the news tilt: the tilt is not calibrated and
+    # must not be able to flip a label. The displayed tables keep it (it only moves the first days).
+    sim_for_rating = sim
+    if sentiment is not None and sentiment.drift_adjustment != 0.0:
+        sim_for_rating = _simulate(np.full(T, expected.final))
 
     sigma_h = vol.total_vol(cfg.rating_horizon)
+    sigma_1y = vol.total_vol(min(252, T))
     context = {
         "drift": f"S&P 500 expected total return {expected.final:+.1%}/yr "
                  f"(E/P {fund.earnings_yield:.1%}, div yield {fund.dividend_yield:.1%}, "
-                 f"macro adj {sum(expected.adjustments.values()):+.1%})",
+                 f"valuation and regime adj {sum(expected.adjustments.values()):+.1%})",
         "vol": f"Implied vol {sigma_h:.0%} to the rating horizon -> leverage decay about "
                f"{etf.theoretical_drag(sigma_h):.0%}/yr; fund costs {etf.annual_cost:.1%}/yr; "
-               f"index needs about {etf.breakeven_index_return(sigma_h):+.1%}/yr for SPXL to break even",
+               f"the index needs about {etf.breakeven_index_return(sigma_1y):+.1%}/yr for SPXL's median to be flat over a year",
     }
     if sentiment is not None:
         context["sentiment"] = (f"News sentiment {sentiment.label.lower()} ({sentiment.score:+.2f}) "
-                                f"-> {sentiment.drift_adjustment:+.1%} annualised drift for {cfg.sentiment_days} days")
-    if macro.curve_10y_3m < 0:
+                                f"-> {sentiment.drift_adjustment:+.1%} annualised drift for {cfg.sentiment_days} days "
+                                f"in the price tables; excluded from this rating")
+    if macro.curve_10y_3m is None:
+        context["macro"] = "Yield curve unavailable (short rate defaulted)"
+    elif macro.curve_10y_3m < 0:
         context["macro"] = f"Yield curve inverted ({macro.curve_10y_3m:+.2%})"
     else:
-        context["macro"] = (f"Yield curve 10y-3m {macro.curve_10y_3m:+.2%}; real 10y "
-                            f"{macro.real_10y:+.2%}" if macro.real_10y is not None else "")
+        context["macro"] = f"Yield curve 10y-3m {macro.curve_10y_3m:+.2%}; 3m bill {macro.rf_3m:.2%} sets the financing cost"
 
-    rating = rate(sim, cfg.rating_horizon, cfg, context)
+    rating = rate(sim_for_rating, cfg.rating_horizon, cfg, context)
     sens = influencer_sensitivities(snap, cfg)
-    return Forecast(cfg=cfg, snap=snap, spot=spot, spot_date=spot_date, macro=macro, fundamentals=fund,
-                    expected=expected, vol=vol, etf=etf, sentiment=sentiment, sim=sim, rating=rating,
-                    sensitivities=sens, mu_path=mu)
+    return Forecast(cfg=cfg, snap=snap, spot=spot, spot_date=spot_date, spot_status=spot_status, macro=macro,
+                    fundamentals=fund, expected=expected, vol=vol, etf=etf, sentiment=sentiment, sim=sim,
+                    rating=rating, sensitivities=sens, mu_path=mu)
 
 
 # ---------------------------------------------------------------------------------------
@@ -128,26 +143,31 @@ def _clean(obj: Any) -> Any:
         return {str(k): _clean(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_clean(v) for v in obj]
-    if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return [_clean(v) for v in obj.tolist()]
+    if isinstance(obj, (np.floating, np.integer)):
+        obj = obj.item()
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
     return obj
 
 
 def forecast_to_dict(fc: Forecast, prices: Optional[List[float]] = None) -> Dict[str, Any]:
     sim = fc.sim
     out: Dict[str, Any] = {
-        "asof": fc.snap.asof.isoformat(),
+        "run_at": fc.snap.asof.isoformat(),
+        "prices_fetched_at": fc.snap.fetched_at.get("prices", fc.snap.asof).isoformat(),
         "etf": fc.cfg.etf,
         "spot": fc.spot,
         "spot_date": fc.spot_date,
+        "spot_status": fc.spot_status,
         "rating": {
             "label": fc.rating.label, "conviction": fc.rating.conviction, "score": fc.rating.score,
+            "score_se": fc.rating.score_se, "borderline": fc.rating.borderline,
             "horizon_days": fc.rating.horizon, "edge_annual": fc.rating.edge_annual,
-            "p_beat_rf": fc.rating.p_beat_rf, "p_positive": fc.rating.p_positive,
-            "median_return": fc.rating.median_return, "mean_return": fc.rating.mean_return,
-            "reasons": fc.rating.reasons,
+            "sharpe_annual": fc.rating.sharpe_annual, "p_beat_rf": fc.rating.p_beat_rf,
+            "p_positive": fc.rating.p_positive, "median_return": fc.rating.median_return,
+            "mean_return": fc.rating.mean_return, "reasons": fc.rating.reasons,
         },
         "forecast": {str(h): {**sim.summary(h), "quantile_prices": sim.quantiles(h),
                               "path_min_quantile_prices": sim.path_min_quantiles(h)} for h in sim.horizons},

@@ -34,7 +34,7 @@ def ordinal(n: float) -> str:
 def horizon_label(days: int) -> str:
     if days % 21 == 0:
         m = days // 21
-        return f"{m}M" if m < 12 else f"{m // 12}Y" if m % 12 == 0 else f"{m}M"
+        return f"{m}M" if m % 12 else f"{m // 12}Y"
     return f"{days}d"
 
 
@@ -44,11 +44,15 @@ def render_header(fc: Forecast, console: Console) -> None:
     text = Text()
     text.append(f"{fc.cfg.etf}  ", style="bold")
     text.append(f"{fc.spot:,.2f}", style="bold cyan")
-    text.append(f"   close {fc.spot_date}   |   S&P 500 {num(idx, 0)}   |   ")
+    text.append(f"   {fc.spot_status} {fc.spot_date}   |   S&P 500 {num(idx, 0)}   |   ")
     text.append(f"VIX {num(fc.macro.vix, 1)}   |   3m bill {pct(fc.macro.rf_3m, 2, False)}   |   "
                 f"10y {pct(fc.macro.y10, 2, False)}")
-    console.print(Panel(text, title="SPXLcast", subtitle=f"data as of {fc.snap.asof:%Y-%m-%d %H:%M UTC}",
+    fetched = fc.snap.fetched_at.get("prices", fc.snap.asof)
+    console.print(Panel(text, title="SPXLcast",
+                        subtitle=f"prices fetched {fetched:%Y-%m-%d %H:%M} UTC  |  run {fc.snap.asof:%H:%M} UTC",
                         box=box.ROUNDED))
+    if fc.spot_status == "intraday":
+        console.print("[dim]The session is open: the spot, VIX and yields are live quotes, not closes.[/dim]")
 
 
 def render_rating(fc: Forecast, console: Console) -> None:
@@ -56,7 +60,7 @@ def render_rating(fc: Forecast, console: Console) -> None:
     style = RATING_STYLE.get(r.label, "bold")
     body = Text()
     body.append(f"{r.label}", style=style)
-    body.append(f"   conviction {r.conviction.lower()}   score {r.score:+.2f}   "
+    body.append(f"   conviction {r.conviction.lower()}   score {r.score:+.2f} (+/- {r.score_se:.2f} Monte Carlo)   "
                 f"horizon {horizon_label(r.horizon)} ({r.horizon} trading days)\n\n")
     for reason in r.reasons:
         body.append(f" - {reason}\n")
@@ -130,17 +134,19 @@ def render_drivers(fc: Forecast, console: Console) -> None:
     t.add_column("Detail")
     infl = m.breakeven_10y if m.breakeven_10y is not None else fc.cfg.expected_inflation_default
     t.add_row("Earnings-yield model", pct(e.earnings_yield_model), f"E/P {f.earnings_yield:.2%} + inflation {infl:.2%}")
-    t.add_row("Dividend-growth model", pct(e.dividend_growth_model), f"div yield {f.dividend_yield:.2%} + EPS growth {f.eps_growth:.2%}")
+    t.add_row("Dividend-growth model", pct(e.dividend_growth_model),
+              f"div yield {f.dividend_yield:.2%} + nominal EPS growth {f.eps_growth:.2%}")
     t.add_row("Base (50/50 blend)", pct(e.base), "")
     for k, val in e.adjustments.items():
-        t.add_row(f"  adj: {k}", pct(val), "")
+        t.add_row(f"  adj: {k}", pct(val), "countercyclical valuation term" if k == "valuation" else "risk-regime penalty")
     for n in e.notes:
         t.add_row("", "", f"[dim]{n}[/dim]")
-    t.add_row("[bold]Final index drift[/bold]", f"[bold]{pct(e.final)}[/bold]",
-              f"clipped to [{fc.cfg.drift_floor:+.0%}, {fc.cfg.drift_cap:+.0%}]")
+    detail = ("command-line override (not clipped)" if fc.cfg.override_index_drift is not None
+              else f"clipped to [{fc.cfg.drift_floor:+.0%}, {fc.cfg.drift_cap:+.0%}]")
+    t.add_row("[bold]Final index drift[/bold]", f"[bold]{pct(e.final)}[/bold]", detail)
     if fc.sentiment is not None:
         t.add_row("News tilt (first %d days)" % fc.cfg.sentiment_days, pct(fc.sentiment.drift_adjustment),
-                  f"{fc.sentiment.label} ({fc.sentiment.score:+.2f})")
+                  f"{fc.sentiment.label} ({fc.sentiment.score:+.2f}); kept small, not calibrated")
     console.print(t)
 
     t = Table(title="Volatility (from the VIX term structure) and SPXL mechanics", box=box.SIMPLE)
@@ -152,16 +158,21 @@ def render_drivers(fc: Forecast, console: Console) -> None:
     hr = fc.cfg.rating_horizon
     sig = v.total_vol(hr)
     t.add_row(f"Index vol to {horizon_label(hr)}", pct(sig, 1, False), "variance-consistent average")
+    t.add_row("Daily shock shape", f"t({fc.cfg.t_dof:.0f}), skew {fc.cfg.skew_gamma:.2f}",
+              "fat tails; skew < 1 means larger down moves than up moves")
     t.add_row("Leverage", f"{etf.leverage:.2f}x", "stated 3x, checked against realised beta")
     t.add_row("Expense ratio", pct(etf.expense_ratio, 2, False), "")
-    t.add_row("Financing cost", pct(etf.financing_rate, 2, False), f"({etf.leverage - 1:.0f}x) x (3m bill + swap spread)")
+    t.add_row("Financing cost", pct(etf.financing_rate, 2, False),
+              f"({etf.leverage - 1:.0f}x) x (3m bill + {fc.cfg.swap_spread:.2%} all-in spread)")
     t.add_row("Volatility decay", pct(etf.theoretical_drag(sig), 1, False),
               "L(L-1)/2 x sigma^2 at the horizon vol (emerges in the simulation)")
-    t.add_row("Break-even index return", pct(etf.breakeven_index_return(sig), 1, False),
-              "index total return needed for SPXL to be flat over a year")
+    sig_1y = v.total_vol(min(252, len(v.daily)))
+    t.add_row("Break-even index return", pct(etf.breakeven_index_return(sig_1y), 1, False),
+              "arithmetic index return at which SPXL's median is flat over a year (at the 1-year vol)")
     if etf.calibration:
         c = etf.calibration
-        t.add_row("Realised beta / R2", f"{c.beta:.2f} / {c.r2:.3f}", f"{c.n} days; tracking noise {c.resid_sd_daily:.2%}/day")
+        t.add_row("Realised beta / R2", f"{c.beta:.2f} / {c.r2:.3f}",
+                  f"{c.n} days, {c.n_outliers} dislocation days excluded; tracking noise {c.resid_sd_daily:.2%}/day")
     for n in v.notes + etf.notes:
         t.add_row("", "", f"[dim]{n}[/dim]")
     console.print(t)
@@ -188,28 +199,34 @@ def render_metrics(fc: Forecast, console: Console) -> None:
                 cells.append(pct(ch))
         t.add_row(tk, desc, f"{last:,.2f}", *cells)
     console.print(t)
-    console.print("[dim]Yield and volatility rows show changes in points; price rows show % changes.[/dim]")
+    console.print("[dim]Yield and volatility rows show changes in points; price rows show % changes. "
+                  "Changes are aligned to the trading calendar; n/a means the series has a gap there.[/dim]")
 
     t = Table(title="S&P 500 valuation and macro backdrop", box=box.SIMPLE)
     t.add_column("Metric")
     t.add_column("Value", justify="right")
     t.add_column("Source")
     src = {**f.sources, **m.sources}
+    curve_note = ""
+    if m.curve_10y_3m is not None and m.curve_10y_3m < 0:
+        curve_note = "inverted = recession signal"
+    elif m.curve_10y_3m is None:
+        curve_note = src.get("curve_10y_3m", "")
     rows = [
         ("Trailing P/E", num(f.trailing_pe, 1), src.get("trailing_pe", "")),
         ("Earnings yield (E/P)", pct(f.earnings_yield, 2, False), src.get("earnings_yield", src.get("trailing_pe", ""))),
         ("Dividend yield", pct(f.dividend_yield, 2, False), src.get("dividend_yield", "")),
-        ("Assumed EPS growth", pct(f.eps_growth, 2, False), src.get("eps_growth", "")),
+        ("Nominal EPS growth assumed", pct(f.eps_growth, 2, False), src.get("eps_growth", "")),
         ("Price/Book", num(1.0 / f.book_to_price, 2) if f.book_to_price else "n/a", "Yahoo funds_data"),
         ("Price/Sales", num(1.0 / f.sales_to_price, 2) if f.sales_to_price else "n/a", "Yahoo funds_data"),
-        ("3m T-bill", pct(m.rf_3m, 2, False), src.get("rf_3m", "")),
-        ("2y Treasury", pct(m.y2, 2, False), src.get("y2", "")),
+        ("3m T-bill (bond-equivalent)", pct(m.rf_3m, 2, False), src.get("rf_3m", "")),
+        ("2y yield", pct(m.y2, 2, False), src.get("y2", "")),
         ("10y Treasury", pct(m.y10, 2, False), src.get("y10", "")),
         ("30y Treasury", pct(m.y30, 2, False), src.get("y30", "")),
-        ("Curve 10y-3m", pct(m.curve_10y_3m, 2), "inverted = recession signal" if m.curve_10y_3m < 0 else ""),
+        ("Curve 10y-3m", pct(m.curve_10y_3m, 2), curve_note),
         ("10y breakeven inflation", pct(m.breakeven_10y, 2, False), src.get("breakeven_10y", "default used")),
         ("Real 10y yield", pct(m.real_10y, 2), src.get("real_10y", "")),
-        ("Equity risk premium (E/P - real 10y)", pct(f.earnings_yield - m.real_10y, 2) if m.real_10y is not None else "n/a", ""),
+        ("E/P minus real 10y", pct(f.earnings_yield - m.real_10y, 2) if m.real_10y is not None else "n/a", "context only"),
         ("HY credit spread (OAS)", pct(m.hy_oas, 2, False), src.get("hy_oas", "FRED unavailable")),
         ("CPI YoY", pct(m.cpi_yoy, 2, False), src.get("cpi_yoy", "FRED unavailable")),
         ("Unemployment", pct(m.unemployment, 1, False), src.get("unemployment", "FRED unavailable")),
@@ -236,6 +253,7 @@ def render_metrics(fc: Forecast, console: Console) -> None:
                       pct(snap.change(sym, 21)) if snap.close(sym) is not None else "n/a",
                       f"{ns:+.2f}" if ns is not None else "n/a")
         console.print(t)
+        console.print("[dim]News tone is per company; share classes (e.g. GOOG/GOOGL) are merged into one.[/dim]")
 
 
 def render_sensitivities(fc: Forecast, console: Console) -> None:
@@ -261,30 +279,32 @@ def render_news(fc: Forecast, console: Console, max_items: int = 5) -> None:
         return
     style = "green" if s.score > 0.15 else "red" if s.score < -0.15 else "yellow"
     console.print(Panel(Text.assemble((f"{s.label}  ", f"bold {style}"),
-                                      (f"score {s.score:+.2f}  from {s.n_used} recent articles "
+                                      (f"score {s.score:+.2f}  from {s.n_used} unique recent stories "
                                        f"({s.n_articles} fetched); near-term drift tilt {s.drift_adjustment:+.1%}/yr", "")),
                         title="News sentiment", box=box.ROUNDED))
+    for n in s.notes:
+        console.print(f"[dim]{n}[/dim]")
     if s.by_ticker:
         line = "  ".join(f"{k} {v:+.2f}" for k, v in sorted(s.by_ticker.items(), key=lambda kv: -abs(kv[1])))
-        console.print(f"[dim]By ticker: {line}[/dim]")
-    for title, items in (("Most positive", s.top_positive), ("Most negative", s.top_negative)):
+        console.print(f"[dim]By feed/company: {line}[/dim]")
+    for title, items in (("Most positive (weighted)", s.top_positive), ("Most negative (weighted)", s.top_negative)):
         if not items:
             continue
         t = Table(title=title, box=box.SIMPLE, show_lines=False)
         t.add_column("Score", justify="right")
-        t.add_column("Ticker")
+        t.add_column("Weight", justify="right")
+        t.add_column("Feed")
         t.add_column("When")
         t.add_column("Headline")
         for x in items[:max_items]:
-            t.add_row(f"{x.score:+.2f}", x.item.ticker, x.item.published.strftime("%m-%d %H:%M"), x.item.title[:110])
+            t.add_row(f"{x.score:+.2f}", f"{x.weight:.2f}", ",".join(dict.fromkeys(x.feeds))[:14],
+                      x.item.published.strftime("%m-%d %H:%M"), x.item.title[:110])
         console.print(t)
 
 
 def render_notes(fc: Forecast, console: Console) -> None:
     for n in fc.snap.notes:
         console.print(f"[yellow]note:[/yellow] {n}")
-    console.print("[dim]Not investment advice. Model output from public data and stated assumptions; "
-                  "a 3x leveraged fund can lose most of its value in a sustained decline.[/dim]")
 
 
 def render_all(fc: Forecast, console: Console, prices: Optional[List[float]] = None,

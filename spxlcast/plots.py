@@ -6,6 +6,7 @@ from typing import List, Optional
 import numpy as np
 
 from .pipeline import Forecast
+from .report import ordinal
 
 
 def save_fan_chart(fc: Forecast, path: str, prices: Optional[List[float]] = None) -> str:
@@ -43,7 +44,7 @@ def save_fan_chart(fc: Forecast, path: str, prices: Optional[List[float]] = None
     for p in prices or []:
         pct = sim.percentile_of_price(p, h)
         ax2.axvline(p, color="#C44E52", lw=1, ls=":")
-        ax2.text(p, ax2.get_ylim()[1] * 0.9, f"{pct:.0f}th pct", color="#C44E52", rotation=90,
+        ax2.text(p, ax2.get_ylim()[1] * 0.9, f"{ordinal(pct)} pct", color="#C44E52", rotation=90,
                  va="top", ha="right", fontsize=8)
     ax2.set_title(f"Distribution at {h} trading days  |  rating: {fc.rating.label}")
     ax2.set_xlabel("price")

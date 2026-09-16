@@ -1,8 +1,8 @@
 """Fundamental and macro drivers of the S&P 500, and the expected-return / volatility inputs.
 
 No technical analysis is used anywhere: the drift comes from valuation (earnings yield, dividend
-yield, earnings growth) and macro conditions (real rates, yield curve, credit, inflation, labour),
-and the volatility comes from the options market (VIX term structure), not from price patterns.
+yield, earnings growth) and macro conditions (yield curve, credit, inflation, labour), and the
+volatility comes from the options market (VIX term structure), not from price patterns.
 """
 from __future__ import annotations
 
@@ -21,20 +21,25 @@ def _pct(v: Optional[float]) -> Optional[float]:
     return None if v is None or not np.isfinite(v) else float(v) / 100.0
 
 
+def discount_to_bey(d: float, days: int = 91) -> float:
+    """Bank-discount T-bill rate (what ^IRX quotes) to bond-equivalent yield (what FRED DGS3MO quotes)."""
+    return 365.0 * d / (360.0 - days * d)
+
+
 @dataclass
 class MacroState:
-    rf_3m: float                       # short risk-free rate (decimal)
+    rf_3m: float                       # short risk-free rate (decimal, bond-equivalent)
     y2: Optional[float]
     y5: Optional[float]
     y10: float
     y30: Optional[float]
-    curve_10y_3m: float
+    curve_10y_3m: Optional[float]      # None when the short rate had to be defaulted
     breakeven_10y: Optional[float]
     real_10y: Optional[float]
     sofr: Optional[float]
     hy_oas: Optional[float]
     unemployment: Optional[float]
-    unemployment_sahm_gap: Optional[float]   # 3m avg minus 12m min (percentage points)
+    unemployment_sahm_gap: Optional[float]   # current 3m avg minus min of the prior 12 3m avgs (pp)
     cpi_yoy: Optional[float]
     vix: Optional[float]                # in vol points (17.5 == 17.5%)
     vix3m: Optional[float]
@@ -53,7 +58,7 @@ class IndexFundamentals:
     trailing_pe: Optional[float]
     earnings_yield: float
     dividend_yield: float
-    eps_growth: float
+    eps_growth: float                  # nominal long-run per-share growth
     book_to_price: Optional[float]
     sales_to_price: Optional[float]
     sources: Dict[str, str] = field(default_factory=dict)
@@ -81,23 +86,44 @@ def build_macro(snap: MarketSnapshot, cfg: Config) -> MacroState:
                 src[label] = f"FRED:{fred_id}"
                 return _pct(v)
         if yahoo:
-            v = snap.last(yahoo)
+            v = snap.fresh_last(yahoo)
             if v is not None:
                 src[label] = f"Yahoo:{yahoo}"
                 return _pct(v)
         return None
 
-    rf_3m = pick("DGS3MO", "^IRX", "rf_3m")
-    if rf_3m is None:
-        rf_3m = 0.04
-        src["rf_3m"] = "default"
-    y10 = pick("DGS10", "^TNX", "y10")
-    if y10 is None:
-        y10 = rf_3m
-        src["y10"] = "default(=rf_3m)"
     y2 = pick("DGS2", "2YY=F", "y2")
+    if src.get("y2") == "Yahoo:2YY=F":
+        src["y2"] = "Yahoo:2YY=F (yield future, ~10-25bp below the 2y CMT)"
     y5 = pick(None, "^FVX", "y5")
+    y10 = pick("DGS10", "^TNX", "y10")
     y30 = pick(None, "^TYX", "y30")
+
+    rf_3m = _pct(snap.fred_last("DGS3MO"))
+    curve_ok = True
+    if rf_3m is not None:
+        src["rf_3m"] = "FRED:DGS3MO"
+    else:
+        irx = snap.fresh_last("^IRX")
+        if irx is not None and np.isfinite(irx) and 0 <= irx < 30:
+            rf_3m = discount_to_bey(irx / 100.0)
+            src["rf_3m"] = "Yahoo:^IRX (discount rate converted to bond-equivalent yield)"
+        elif y2 is not None:
+            rf_3m, src["rf_3m"] = y2, "proxy: 2y yield (3m bill unavailable)"
+            curve_ok = False
+        elif y10 is not None:
+            rf_3m, src["rf_3m"] = y10, "proxy: 10y yield (3m bill unavailable)"
+            curve_ok = False
+        else:
+            rf_3m, src["rf_3m"] = 0.04, "default 4%"
+            curve_ok = False
+    if y10 is None:
+        y10, src["y10"] = rf_3m, "default (= short rate)"
+        curve_ok = False
+    curve = (y10 - rf_3m) if curve_ok else None
+    if curve is None:
+        src["curve_10y_3m"] = "unavailable (short rate defaulted); inversion signal skipped"
+
     breakeven = pick("T10YIE", None, "breakeven_10y")
     real_10y = pick("DFII10", None, "real_10y")
     if real_10y is None:
@@ -109,10 +135,11 @@ def build_macro(snap: MarketSnapshot, cfg: Config) -> MacroState:
     unemployment = None
     sahm_gap = None
     un = snap.fred.get("UNRATE")
-    if un is not None and len(un.dropna()) >= 12:
+    if un is not None and len(un.dropna()) >= 15:
         un = un.dropna()
         unemployment = float(un.iloc[-1]) / 100.0
-        sahm_gap = float(un.iloc[-3:].mean() - un.iloc[-12:].min())
+        roll = un.rolling(3).mean()
+        sahm_gap = float(roll.iloc[-1] - roll.iloc[-13:-1].min())   # Sahm: 3m avg vs min of prior 12 3m avgs
         src["unemployment"] = "FRED:UNRATE"
 
     cpi_yoy = None
@@ -123,20 +150,25 @@ def build_macro(snap: MarketSnapshot, cfg: Config) -> MacroState:
         src["cpi_yoy"] = "FRED:CPIAUCSL"
 
     return MacroState(
-        rf_3m=rf_3m, y2=y2, y5=y5, y10=y10, y30=y30, curve_10y_3m=y10 - rf_3m,
+        rf_3m=rf_3m, y2=y2, y5=y5, y10=y10, y30=y30, curve_10y_3m=curve,
         breakeven_10y=breakeven, real_10y=real_10y, sofr=sofr, hy_oas=hy_oas,
         unemployment=unemployment, unemployment_sahm_gap=sahm_gap, cpi_yoy=cpi_yoy,
-        vix=snap.last("^VIX"), vix3m=snap.last("^VIX3M"), vix6m=snap.last("^VIX6M"),
-        vvix=snap.last("^VVIX"), skew=snap.last("^SKEW"),
-        dxy=snap.last("DX-Y.NYB"), oil=snap.last("CL=F"), gold=snap.last("GC=F"),
+        vix=snap.fresh_last("^VIX"), vix3m=snap.fresh_last("^VIX3M"), vix6m=snap.fresh_last("^VIX6M"),
+        vvix=snap.fresh_last("^VVIX"), skew=snap.fresh_last("^SKEW"),
+        dxy=snap.fresh_last("DX-Y.NYB"), oil=snap.fresh_last("CL=F"), gold=snap.fresh_last("GC=F"),
         sources=src,
     )
 
 
-def build_fundamentals(snap: MarketSnapshot, cfg: Config) -> IndexFundamentals:
+def expected_inflation(macro: MacroState, cfg: Config) -> float:
+    return macro.breakeven_10y if macro.breakeven_10y is not None else cfg.expected_inflation_default
+
+
+def build_fundamentals(snap: MarketSnapshot, cfg: Config, inflation: Optional[float] = None) -> IndexFundamentals:
     src: Dict[str, str] = {}
     info = snap.info(cfg.index_etf)
     stats = snap.equity_stats or {}
+    inflation = cfg.expected_inflation_default if inflation is None else inflation
 
     trailing_pe = cfg.override_trailing_pe
     if trailing_pe is not None:
@@ -176,8 +208,12 @@ def build_fundamentals(snap: MarketSnapshot, cfg: Config) -> IndexFundamentals:
                 dividend_yield = 0.013
                 src["dividend_yield"] = "default 1.3%"
 
-    eps_growth = cfg.long_run_eps_growth
-    src["eps_growth"] = f"config long_run_eps_growth={eps_growth:.3f}"
+    if cfg.override_eps_growth is not None:
+        eps_growth = cfg.override_eps_growth
+        src["eps_growth"] = "override"
+    else:
+        eps_growth = cfg.long_run_real_eps_growth + inflation
+        src["eps_growth"] = f"real {cfg.long_run_real_eps_growth:.1%} + inflation {inflation:.2%}"
 
     return IndexFundamentals(
         index_level=snap.last(cfg.index), trailing_pe=trailing_pe, earnings_yield=earnings_yield,
@@ -189,14 +225,19 @@ def build_fundamentals(snap: MarketSnapshot, cfg: Config) -> IndexFundamentals:
 
 # ---------------------------------------------------------------------------------------
 def expected_index_return(fund: IndexFundamentals, macro: MacroState, cfg: Config) -> ExpectedReturn:
-    """Blend two classic long-run models, then apply transparent macro adjustments.
+    """Blend two classic long-run models, then apply transparent, capped adjustments.
 
     * Earnings-yield model:   E[r] = earnings yield + expected inflation
       (real return ~ E/P; the breakeven adds the nominal component)
     * Dividend-growth model:  E[r] = dividend yield + long-run nominal EPS growth
+    * Valuation term (countercyclical): E/P above its neutral level adds drift, below subtracts.
+      It is deliberately absolute (not relative to bond yields) so interest rates are charged to
+      SPXL only once, through the fund's financing cost.
+    * Regime penalties (inverted curve, credit stress, hot inflation, weak labour) are small and
+      capped in total: at a 6-month horizon they describe risk rather than forecast returns.
     """
     notes: List[str] = []
-    infl = macro.breakeven_10y if macro.breakeven_10y is not None else cfg.expected_inflation_default
+    infl = expected_inflation(macro, cfg)
     m_ey = fund.earnings_yield + infl
     m_dg = fund.dividend_yield + fund.eps_growth
     base = 0.5 * m_ey + 0.5 * m_dg
@@ -208,29 +249,32 @@ def expected_index_return(fund: IndexFundamentals, macro: MacroState, cfg: Confi
         return ExpectedReturn(m_ey, m_dg, base, adj, final, notes)
 
     if cfg.use_macro_adjustments:
-        # 1) Equity risk premium versus real yields: cheap vs. bonds => higher drift, and vice versa.
-        if macro.real_10y is not None:
-            erp = fund.earnings_yield - macro.real_10y
-            a = float(np.clip((erp - cfg.neutral_erp) * cfg.erp_sensitivity, -cfg.erp_adj_cap, cfg.erp_adj_cap))
-            adj["equity_risk_premium"] = a
-            notes.append(f"ERP (E/P minus real 10y) = {erp:+.2%} vs neutral {cfg.neutral_erp:.2%}")
-        # 2) Yield-curve inversion is the classic recession signal.
-        if macro.curve_10y_3m < 0:
+        a = float(np.clip((fund.earnings_yield - cfg.neutral_earnings_yield) * cfg.valuation_sensitivity,
+                          -cfg.valuation_adj_cap, cfg.valuation_adj_cap))
+        adj["valuation"] = a
+        notes.append(f"E/P {fund.earnings_yield:.2%} vs neutral {cfg.neutral_earnings_yield:.2%} "
+                     f"(P/E {1 / fund.earnings_yield:.1f} vs {1 / cfg.neutral_earnings_yield:.0f})")
+
+        regime: Dict[str, float] = {}
+        if macro.curve_10y_3m is not None and macro.curve_10y_3m < 0:
             depth = min(1.0, -macro.curve_10y_3m / 0.01)
-            adj["inverted_yield_curve"] = -cfg.inverted_curve_penalty * depth
+            regime["inverted_yield_curve"] = -cfg.inverted_curve_penalty * depth
             notes.append(f"10y-3m curve inverted by {macro.curve_10y_3m:.2%}")
-        # 3) Credit stress.
         if macro.hy_oas is not None and macro.hy_oas > cfg.hy_stress_level:
-            adj["credit_stress"] = -float(min(macro.hy_oas - cfg.hy_stress_level, cfg.hy_stress_cap))
+            regime["credit_stress"] = -float(min(macro.hy_oas - cfg.hy_stress_level, cfg.hy_stress_cap))
             notes.append(f"HY OAS {macro.hy_oas:.2%} above stress level {cfg.hy_stress_level:.2%}")
-        # 4) Hot inflation raises the odds of tighter policy.
         if macro.cpi_yoy is not None and macro.cpi_yoy > cfg.inflation_hot_level:
-            adj["hot_inflation"] = -float(min((macro.cpi_yoy - cfg.inflation_hot_level) * 0.5, cfg.inflation_adj_cap))
+            regime["hot_inflation"] = -float(min((macro.cpi_yoy - cfg.inflation_hot_level) * 0.5, cfg.inflation_adj_cap))
             notes.append(f"CPI YoY {macro.cpi_yoy:.2%} above {cfg.inflation_hot_level:.2%}")
-        # 5) Sahm-rule style labour deterioration.
         if macro.unemployment_sahm_gap is not None and macro.unemployment_sahm_gap >= 0.5:
-            adj["labour_deterioration"] = -cfg.sahm_penalty
-            notes.append(f"Unemployment 3m-avg exceeds 12m-min by {macro.unemployment_sahm_gap:.2f}pp")
+            regime["labour_deterioration"] = -cfg.sahm_penalty
+            notes.append(f"Unemployment 3m-avg exceeds the 12m-min by {macro.unemployment_sahm_gap:.2f}pp (Sahm)")
+        total = sum(regime.values())
+        if total < -cfg.regime_adj_cap:
+            scale = cfg.regime_adj_cap / -total
+            regime = {k: v * scale for k, v in regime.items()}
+            notes.append(f"regime penalties scaled to the {cfg.regime_adj_cap:.1%} cap")
+        adj.update(regime)
 
     final = float(np.clip(base + sum(adj.values()), cfg.drift_floor, cfg.drift_cap))
     return ExpectedReturn(m_ey, m_dg, base, adj, final, notes)
@@ -258,27 +302,37 @@ class VolTermStructure:
         return float(np.sqrt(var_daily_sum * 252.0 / h))
 
 
+def _haircuts(cfg: Config):
+    v = cfg.vrp_vol_points
+    if v is None:
+        return (0.0, 0.0, 0.0)
+    if np.ndim(v) == 0:
+        return (float(v),) * 3
+    v = tuple(float(x) for x in v) or (0.0,)
+    return (v + (v[-1],) * 3)[:3]
+
+
 def vol_term_structure(macro: MacroState, snap: MarketSnapshot, cfg: Config, horizon: int) -> VolTermStructure:
     notes: List[str] = []
     if cfg.override_vol is not None:
         daily = np.full(horizon, float(cfg.override_vol))
         return VolTermStructure(daily, {horizon: float(cfg.override_vol)}, ["flat vol override"])
 
-    haircut = cfg.vrp_vol_points / 100.0
+    h1, h3, h6 = _haircuts(cfg)
     close = snap.close(cfg.index_etf)
     rv = realized_vol(close, 63) if close is not None else None
 
-    def implied(v: Optional[float], fallback: float) -> float:
+    def implied(v: Optional[float], haircut_pts: float, fallback: float) -> float:
         if v is None or not np.isfinite(v) or v <= 0:
             return fallback
-        return max(cfg.vol_floor, v / 100.0 - haircut)
+        return max(cfg.vol_floor, v / 100.0 - haircut_pts / 100.0)
 
     fallback = rv if rv is not None else cfg.long_run_vol
     if macro.vix is None:
-        notes.append("VIX unavailable: using realised vol as the 1-month pillar")
-    s1 = implied(macro.vix, fallback)
-    s3 = implied(macro.vix3m, s1)
-    s6 = implied(macro.vix6m, s3)
+        notes.append("VIX unavailable or stale: using realised vol as the 1-month pillar")
+    s1 = implied(macro.vix, h1, fallback)
+    s3 = implied(macro.vix3m, h3, s1)
+    s6 = implied(macro.vix6m, h6, s3)
     s12 = float(np.sqrt(0.5 * s6 ** 2 + 0.5 * cfg.long_run_vol ** 2))  # mean-revert toward long run
     pillars = {21: s1, 63: s3, 126: s6, 252: s12}
 
@@ -294,7 +348,7 @@ def vol_term_structure(macro: MacroState, snap: MarketSnapshot, cfg: Config, hor
         prev_var = prev_var + fwd_var * (h - prev_h)
         prev_h = h
     daily[252:] = daily[251]
-    notes.append(f"pillars after {cfg.vrp_vol_points:.1f}pt VRP haircut: "
+    notes.append(f"pillars after VRP haircuts of {h1:.0f}/{h3:.0f}/{h6:.0f} pts: "
                  + ", ".join(f"{h}d {s:.1%}" for h, s in pillars.items()))
     if rv is not None:
         notes.append(f"realised 3m vol of {cfg.index_etf}: {rv:.1%} (diagnostic only)")

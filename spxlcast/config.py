@@ -5,7 +5,7 @@ Rates, yields and returns are expressed as decimals (0.05 == 5%) unless stated o
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 
@@ -22,51 +22,63 @@ class Config:
     rating_horizon: int = 126         # the rating is judged on this horizon
 
     # --- Monte Carlo ----------------------------------------------------------------
-    n_paths: int = 20_000
+    n_paths: int = 50_000
     seed: Optional[int] = 42
     t_dof: float = 4.0                # Student-t degrees of freedom for daily index shocks (fat tails)
+    skew_gamma: float = 0.9           # Fernandez-Steel skew of the daily shock; 1.0 = symmetric, <1 = negative skew
     max_daily_move: float = 0.20      # index circuit-breaker: a single day cannot move more than +/-20%
 
     # --- Expected-return model for the S&P 500 (annualised, nominal, total return) -------
-    long_run_eps_growth: float = 0.055      # nominal earnings growth used in the dividend-growth model
+    long_run_real_eps_growth: float = 0.03     # real per-share earnings growth; nominal = this + expected inflation
     expected_inflation_default: float = 0.025  # used when a market breakeven is unavailable
-    neutral_erp: float = 0.035              # "normal" earnings-yield minus real-10y spread
-    erp_sensitivity: float = 0.5            # drift adj per 1.00 of ERP deviation (capped below)
-    erp_adj_cap: float = 0.015
-    inverted_curve_penalty: float = 0.02    # full penalty when 10y-3m <= -1.0%
-    hy_stress_level: float = 0.05           # HY OAS above this is treated as credit stress
-    hy_stress_cap: float = 0.03
-    inflation_hot_level: float = 0.035      # CPI YoY above this is a headwind
-    inflation_adj_cap: float = 0.015
-    sahm_penalty: float = 0.02              # unemployment 3m-avg >= 12m-min + 0.5 => recession signal
+    neutral_earnings_yield: float = 0.05       # trailing E/P at which the valuation term is zero (P/E 20)
+    valuation_sensitivity: float = 0.5         # drift adj per 1.00 of E/P deviation from neutral (capped below)
+    valuation_adj_cap: float = 0.015
+    # Risk-regime descriptors. They are small and capped in total: at a 6-month horizon these signals
+    # describe risk, they do not forecast returns (inverted curves and wide spreads often precede rallies).
+    inverted_curve_penalty: float = 0.01       # full penalty when 10y-3m <= -1.0%
+    hy_stress_level: float = 0.05              # HY OAS above this is treated as credit stress
+    hy_stress_cap: float = 0.015
+    inflation_hot_level: float = 0.035         # CPI YoY above this is a headwind
+    inflation_adj_cap: float = 0.01
+    sahm_penalty: float = 0.01                 # 3m-avg unemployment >= 12m-min of 3m-avg + 0.5pp
+    regime_adj_cap: float = 0.015              # cap on the sum of the regime penalties
     drift_floor: float = -0.10
     drift_cap: float = 0.20
     use_macro_adjustments: bool = True
 
     # --- Volatility -------------------------------------------------------------------
-    vrp_vol_points: float = 2.0       # implied vol usually exceeds realised vol by ~2 points
+    # Implied vol exceeds subsequently realised vol by more at longer tenors (variance risk premium):
+    # haircut in vol points for the 1-month, 3-month and 6-month pillars. Backtested 2016-2026.
+    vrp_vol_points: Tuple[float, float, float] = (2.0, 4.0, 6.0)
     vol_floor: float = 0.08
     long_run_vol: float = 0.16        # S&P 500 long-run annualised vol, used beyond the VIX curve
+    max_stale_sessions: int = 5       # ignore a market series whose last observation is older than this
 
     # --- Leveraged ETF costs -----------------------------------------------------------
     expense_ratio_default: float = 0.0091   # used if Yahoo does not report one
-    swap_spread: float = 0.004              # financing spread over the short rate on swap notional
+    swap_spread: float = 0.0075             # all-in financing spread over the 3m bill on the borrowed (L-1)x notional;
+                                            # calibrated so that 3x SPY minus costs reproduces SPXL over 1-5 years
     calibration_lookback_days: int = 504    # ~2 years for the beta / tracking calibration
+    calibration_outlier_mads: float = 5.0   # residuals beyond this many robust SDs are excluded from the fit
 
     # --- News sentiment --------------------------------------------------------------
     use_news: bool = True
-    news_tickers: Tuple[str, ...] = ("SPXL", "SPY", "^GSPC")
+    news_tickers: Tuple[str, ...] = ("SPXL", "SPY", "^GSPC", "^VIX", "^TNX")   # market-wide feeds
     news_holdings_top_n: int = 10           # also read news for the top-N S&P 500 constituents
     news_half_life_days: float = 2.0
     news_max_age_days: float = 7.0
-    sentiment_drift_scale: float = 0.10     # annualised drift shift when the sentiment score is +/-1
-    sentiment_days: int = 21                # ... applied to the first N trading days only
+    summary_weight: float = 0.2             # share of the article score taken from the teaser summary
+    offtopic_weight: float = 0.25           # relevance of a story that is not about the market or the company
+    sentiment_drift_scale: float = 0.05     # annualised drift shift when the sentiment score is +/-1 (uncalibrated)
+    sentiment_days: int = 10                # ... applied to the first N trading days only
 
     # --- Rating ----------------------------------------------------------------------
     buy_score: float = 0.30
     sell_score: float = -0.30
-    edge_scale: float = 0.15                # annualised excess return that maps to score = 1
-    prob_scale: float = 0.10                # P(beat T-bill) - 0.5 that maps to score = 1
+    edge_scale: float = 0.15                # annualised median excess return that maps to score = 1
+    sharpe_scale: float = 0.5               # annualised mean-excess-return / vol that maps to score = 1
+    score_blocks: int = 20                  # path blocks used for the Monte Carlo standard error of the score
 
     # --- Data ------------------------------------------------------------------------
     history_period: str = "5y"
@@ -83,6 +95,7 @@ class Config:
     override_vol: Optional[float] = None           # flat annualised vol
     override_dividend_yield: Optional[float] = None
     override_trailing_pe: Optional[float] = None
+    override_eps_growth: Optional[float] = None    # nominal long-run EPS growth
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -98,8 +111,8 @@ MARKET_TICKERS = {
     "^VIX6M": "VIX 6-month (%)",
     "^VVIX": "VVIX (vol of vol)",
     "^SKEW": "CBOE SKEW (tail-risk pricing)",
-    "^IRX": "13-week T-bill yield (%)",
-    "2YY=F": "2-year Treasury yield (%)",
+    "^IRX": "13-week T-bill, discount basis (%)",
+    "2YY=F": "2-year yield future, CBOT front month (%)",
     "^FVX": "5-year Treasury yield (%)",
     "^TNX": "10-year Treasury yield (%)",
     "^TYX": "30-year Treasury yield (%)",

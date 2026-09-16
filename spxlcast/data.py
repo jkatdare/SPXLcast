@@ -2,6 +2,7 @@
 
 Everything is cached on disk (see cache.py). Every fetch is defensive: a missing ticker or a
 timed-out FRED call degrades to ``None`` and a note in ``MarketSnapshot.notes`` instead of an error.
+Failed or empty fetches are never cached.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,16 @@ from .cache import Cache
 from .config import FRED_SERIES, MARKET_TICKERS, Config
 
 log = logging.getLogger(__name__)
+NY_TZ = "America/New_York"
+
+
+def _match_tz(ts: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
+    """Make a timestamp comparable with ``index`` (tz-naive vs tz-aware inputs must not crash)."""
+    ts = pd.Timestamp(ts)
+    tz = getattr(index, "tz", None)
+    if tz is None:
+        return ts.tz_convert(None) if ts.tzinfo is not None else ts
+    return ts.tz_localize(tz) if ts.tzinfo is None else ts.tz_convert(tz)
 
 
 @dataclass
@@ -35,14 +46,18 @@ class NewsItem:
 
 @dataclass
 class MarketSnapshot:
-    asof: datetime
+    asof: datetime                                   # run time (UTC)
     prices: Dict[str, pd.DataFrame] = field(default_factory=dict)  # ticker -> OHLCV, auto-adjusted
     infos: Dict[str, dict] = field(default_factory=dict)
-    holdings: Optional[pd.DataFrame] = None  # columns: symbol, name, weight
+    holdings: Optional[pd.DataFrame] = None          # columns: symbol, name, weight
     equity_stats: Dict[str, float] = field(default_factory=dict)  # yield-style ratios from SPY fund data
     fred: Dict[str, pd.Series] = field(default_factory=dict)
     news: List[NewsItem] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    calendar: Optional[pd.DatetimeIndex] = None      # trading sessions of the index ETF
+    intraday: bool = False                           # last price bar is a live, partial session
+    fetched_at: Dict[str, datetime] = field(default_factory=dict)   # dataset -> UTC fetch time
+    max_stale_sessions: int = 5
 
     # ---- convenience accessors -------------------------------------------------------
     def close(self, ticker: str) -> Optional[pd.Series]:
@@ -60,19 +75,54 @@ class MarketSnapshot:
         s = self.close(ticker)
         return s.index[-1] if s is not None else None
 
-    def change(self, ticker: str, days: int) -> Optional[float]:
-        """Fractional change in the close over the last ``days`` trading days."""
+    def _sessions_between(self, earlier: pd.Timestamp, later: pd.Timestamp) -> int:
+        cal = self.calendar
+        if cal is None:
+            return 0
+        earlier, later = _match_tz(earlier, cal), _match_tz(later, cal)
+        return int(cal.searchsorted(later) - cal.searchsorted(earlier))
+
+    def fresh_last(self, ticker: str) -> Optional[float]:
+        """Last close, or None if the series is stale versus the trading calendar."""
         s = self.close(ticker)
-        if s is None or len(s) <= days:
+        if s is None:
             return None
-        return float(s.iloc[-1] / s.iloc[-1 - days] - 1.0)
+        if self.calendar is not None and self._sessions_between(s.index[-1], self.calendar[-1]) > self.max_stale_sessions:
+            return None
+        return float(s.iloc[-1])
+
+    def _reference(self, ticker: str, days: int) -> Optional[Tuple[float, float]]:
+        """(last, value ``days`` sessions before the series' own latest observation), counted on the
+        trading calendar. None when the latest observation is stale versus the calendar, or when the
+        series has no observation close enough to the reference session (a hole in the history)."""
+        s = self.close(ticker)
+        if s is None or days < 1:
+            return None
+        cal = self.calendar if self.calendar is not None else s.index
+        last_date = _match_tz(s.index[-1], cal)
+        if self.calendar is not None and self._sessions_between(last_date, cal[-1]) > self.max_stale_sessions:
+            return None
+        pos = int(cal.searchsorted(last_date, side="right")) - 1   # calendar slot of the latest observation
+        if pos - days < 0:
+            return None
+        ref_date = _match_tz(cal[pos - days], s.index)
+        obs = s[s.index <= ref_date]
+        if obs.empty or _match_tz(obs.index[-1], cal) == last_date:
+            return None
+        tolerance = min(3, days - 1)                                # exact match for 1D, a few sessions for longer windows
+        if self._sessions_between(obs.index[-1], _match_tz(ref_date, cal)) > tolerance:
+            return None
+        return float(s.iloc[-1]), float(obs.iloc[-1])
+
+    def change(self, ticker: str, days: int) -> Optional[float]:
+        """Fractional change in the close over the last ``days`` trading sessions."""
+        ref = self._reference(ticker, days)
+        return None if ref is None or ref[1] == 0 else ref[0] / ref[1] - 1.0
 
     def diff(self, ticker: str, days: int) -> Optional[float]:
-        """Absolute change over ``days`` trading days (for yields quoted in %)."""
-        s = self.close(ticker)
-        if s is None or len(s) <= days:
-            return None
-        return float(s.iloc[-1] - s.iloc[-1 - days])
+        """Absolute change over ``days`` trading sessions (for yields quoted in %)."""
+        ref = self._reference(ticker, days)
+        return None if ref is None else ref[0] - ref[1]
 
     def fred_last(self, series_id: str) -> Optional[float]:
         s = self.fred.get(series_id)
@@ -85,21 +135,41 @@ class MarketSnapshot:
 
 
 # ---------------------------------------------------------------------------------------
+# Trading-session helpers
+# ---------------------------------------------------------------------------------------
+def ny_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=NY_TZ)
+
+
+def session_state(now: Optional[pd.Timestamp] = None) -> Tuple[str, bool]:
+    """(New York date, is the regular session open right now)."""
+    now = now if now is not None else ny_now()
+    t = now.time()
+    is_open = now.weekday() < 5 and (t.hour, t.minute) >= (9, 30) and t.hour < 16
+    return str(now.date()), is_open
+
+
+# ---------------------------------------------------------------------------------------
 # Yahoo Finance
 # ---------------------------------------------------------------------------------------
 def _tidy_history(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+        df.index = df.index.tz_convert(NY_TZ).tz_localize(None)
     df.index = df.index.normalize()
     df = df[~df.index.duplicated(keep="last")]
     return df.dropna(subset=["Close"]) if "Close" in df else df
 
 
-def fetch_prices(tickers: List[str], period: str, cache: Cache, ttl_hours: float) -> Dict[str, pd.DataFrame]:
-    key = f"prices:{period}:{','.join(sorted(tickers))}"
+def fetch_prices(tickers: List[str], period: str, cache: Cache, ttl_hours: float,
+                 required: Tuple[str, ...] = ()) -> Tuple[Dict[str, pd.DataFrame], Optional[float]]:
+    """Download histories. The cache key carries the NY session date and open/closed state so a
+    price fetched during the session is never served as the close after the bell. Returns the
+    data and the Unix time it was fetched (cache mtime)."""
+    ny_date, is_open = session_state()
+    key = f"prices:{period}:{','.join(sorted(tickers))}:{ny_date}:{'open' if is_open else 'closed'}"
 
-    def _download() -> Dict[str, pd.DataFrame]:
+    def _download() -> Optional[Dict[str, pd.DataFrame]]:
         out: Dict[str, pd.DataFrame] = {}
         try:
             raw = yf.download(
@@ -128,9 +198,23 @@ def fetch_prices(tickers: List[str], period: str, cache: Cache, ttl_hours: float
                         out[t] = _tidy_history(h)
                 except Exception as exc:  # pragma: no cover - network
                     log.debug("history failed for %s: %s", t, exc)
+        if any(t not in out for t in required):
+            return None   # do not cache a download that lacks the essentials
         return out
 
-    return cache.get_or_fetch(key, ttl_hours, _download) or {}
+    data = cache.get_or_fetch(key, ttl_hours, _download) or {}
+    # Yahoo intermittently returns only the latest bar for some indices (^VIX3M, ^VIX6M). Keep a
+    # per-ticker archive that accumulates every row ever seen so a partial response never erases
+    # history; the archive is refreshed with new rows and served back merged.
+    for t, df in list(data.items()):
+        akey = f"archive:{t}:{period}"
+        old = cache.get(akey, ttl_hours=10 ** 6)
+        merged = df if old is None else pd.concat([old, df]).sort_index()
+        merged = merged[~merged.index.duplicated(keep="last")]
+        if old is None or len(merged) != len(old) or not merged.index[-1] == old.index[-1]:
+            cache.put(akey, merged)
+        data[t] = merged
+    return data, cache.mtime(key)
 
 
 def fetch_info(ticker: str, cache: Cache, ttl_hours: float) -> dict:
@@ -186,6 +270,8 @@ def fetch_holdings(fund: str, cache: Cache, ttl_hours: float):
                             stats[name] = float(val)
         except Exception as exc:  # pragma: no cover - network
             log.debug("funds_data failed for %s: %s", fund, exc)
+        if holdings is None and not stats:
+            return None
         return {"holdings": holdings, "stats": stats}
 
     res = cache.get_or_fetch(f"holdings:{fund}", ttl_hours, _fetch) or {}
@@ -194,22 +280,29 @@ def fetch_holdings(fund: str, cache: Cache, ttl_hours: float):
 
 def _parse_news(ticker: str, raw: list) -> List[NewsItem]:
     items: List[NewsItem] = []
-    now = datetime.now(timezone.utc)
     for entry in raw or []:
         content = entry.get("content") if isinstance(entry.get("content"), dict) else entry
         title = (content.get("title") or "").strip()
         if not title:
             continue
         summary = (content.get("summary") or content.get("description") or "").strip()
-        published = now
+        published = None
         stamp = content.get("pubDate") or content.get("displayTime")
         if isinstance(stamp, str) and stamp:
             try:
                 published = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
             except ValueError:
-                pass
-        elif entry.get("providerPublishTime"):
-            published = datetime.fromtimestamp(float(entry["providerPublishTime"]), tz=timezone.utc)
+                published = None
+        if published is None and entry.get("providerPublishTime"):
+            try:
+                epoch = float(entry["providerPublishTime"])
+                if 0 < epoch < 4e9:   # seconds, not milliseconds
+                    published = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                published = None
+        if published is None:
+            log.debug("dropping undated news item: %s", title[:60])
+            continue
         if published.tzinfo is None:
             published = published.replace(tzinfo=timezone.utc)
         provider = content.get("provider")
@@ -252,9 +345,13 @@ def _fred_one(series_id: str, timeout: float) -> Optional[pd.Series]:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 spxlcast"})
     resp.raise_for_status()
+    if "text/csv" not in resp.headers.get("Content-Type", "") and not resp.text.lower().startswith(("date", "observation")):
+        return None
     df = pd.read_csv(io.StringIO(resp.text))
+    if df.shape[1] != 2:
+        return None
     df.columns = ["date", "value"]
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     s = df.dropna().set_index("date")["value"]
     return s if len(s) else None
@@ -289,9 +386,14 @@ def fetch_fred(series_ids: List[str], cache: Cache, ttl_hours: float, timeout: f
 # ---------------------------------------------------------------------------------------
 # Snapshot assembly
 # ---------------------------------------------------------------------------------------
+def _utc(ts: Optional[float]) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)
+
+
 def load_market(cfg: Config) -> MarketSnapshot:
-    cache = Cache(cfg.cache_dir, enabled=not cfg.refresh)
-    snap = MarketSnapshot(asof=datetime.now(timezone.utc))
+    cache = Cache(cfg.cache_dir, read_enabled=not cfg.refresh)
+    cache.prune(max_age_hours=72)
+    snap = MarketSnapshot(asof=datetime.now(timezone.utc), max_stale_sessions=cfg.max_stale_sessions)
 
     snap.holdings, snap.equity_stats = fetch_holdings(cfg.index_etf, cache, cfg.info_ttl_hours)
     top_symbols: List[str] = []
@@ -299,10 +401,25 @@ def load_market(cfg: Config) -> MarketSnapshot:
         top_symbols = [s for s in snap.holdings["symbol"].tolist()[: cfg.news_holdings_top_n]]
 
     tickers = list(dict.fromkeys(list(MARKET_TICKERS.keys()) + top_symbols))
-    snap.prices = fetch_prices(tickers, cfg.history_period, cache, cfg.price_ttl_hours)
+    snap.prices, price_time = fetch_prices(tickers, cfg.history_period, cache, cfg.price_ttl_hours,
+                                           required=(cfg.etf, cfg.index_etf))
+    snap.fetched_at["prices"] = _utc(price_time)
     missing = [t for t in tickers if t not in snap.prices]
     if missing:
         snap.notes.append("No price history for: " + ", ".join(missing))
+
+    # Trading calendar from the index ETF; drop CBOE/CBOT index rows on NYSE holidays.
+    idx_close = snap.close(cfg.index_etf)
+    if idx_close is not None:
+        snap.calendar = idx_close.index
+        for t in list(snap.prices):
+            if t.startswith("^"):
+                df = snap.prices[t]
+                snap.prices[t] = df[df.index.isin(snap.calendar)]
+    # Is the latest bar a live, partial session?
+    ny_date, is_open = session_state()
+    last = snap.last_date(cfg.etf)
+    snap.intraday = bool(last is not None and str(last.date()) == ny_date and is_open)
 
     info_tickers = [cfg.etf, cfg.index_etf] + top_symbols
     snap.infos = fetch_infos(info_tickers, cache, cfg.info_ttl_hours)
@@ -319,6 +436,7 @@ def load_market(cfg: Config) -> MarketSnapshot:
     if cfg.use_news:
         news_tickers = list(dict.fromkeys(list(cfg.news_tickers) + top_symbols))
         snap.news = fetch_news(news_tickers, cache, cfg.news_ttl_hours)
+        snap.fetched_at["news"] = _utc(min((cache.mtime(f"news:{t}") or 0) for t in news_tickers) or None)
         if not snap.news:
             snap.notes.append("No news returned by Yahoo; sentiment set to neutral")
 
