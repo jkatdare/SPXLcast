@@ -132,7 +132,21 @@ def simulate(
     skew_gamma: float = 1.0,
     max_daily_move: float = 0.20,
     seed: Optional[int] = 42,
+    drift_sd_annual: float = 0.0,
+    sv_persistence: float = 0.0,
+    sv_logvol_sd: float = 0.0,
+    sv_leverage: float = 0.0,
 ) -> SimulationResult:
+    """Simulate SPXL paths.
+
+    ``drift_sd_annual`` > 0 draws each path's index drift from Normal(mu, sd): parameter
+    uncertainty about the expected return, which widens long horizons without changing the mean.
+    ``sv_logvol_sd`` > 0 switches on stochastic volatility: each path carries a log-vol deviation
+    x that follows an AR(1) with persistence ``sv_persistence`` and stationary sd ``sv_logvol_sd``;
+    the daily vol is sigma_t * exp(x - sd^2) so that E[vol^2] equals the term-structure variance on
+    average. ``sv_leverage`` correlates today's return shock with tomorrow's vol innovation (negative
+    = vol rises after falls), which produces volatility clustering and extra downside skew.
+    """
     horizons = sorted(int(h) for h in horizons)
     if not horizons or horizons[0] < 1:
         raise ValueError("horizons must be positive integers")
@@ -142,6 +156,8 @@ def simulate(
         raise ValueError("dof must exceed 2 for a finite variance")
     if skew_gamma <= 0:
         raise ValueError("skew_gamma must be positive (1 = symmetric)")
+    if not (0.0 <= sv_persistence < 1.0) or sv_logvol_sd < 0 or not (-1.0 <= sv_leverage <= 1.0):
+        raise ValueError("stochastic-vol parameters out of range")
     T = max(horizons)
     mu_annual = np.broadcast_to(np.asarray(mu_annual, dtype=float), (T,))
     sigma_annual = np.broadcast_to(np.asarray(sigma_annual, dtype=float), (T,))
@@ -157,12 +173,31 @@ def simulate(
     fan = np.empty((T + 1, len(QUANTILES)))
     fan[0] = spot
 
+    # Per-path drift offset (parameter uncertainty), anchored on the long-run drift.
+    off = np.zeros(n_paths)
+    if drift_sd_annual > 0:
+        base = float(mu_annual[-1])
+        eps = np.clip(rng.normal(0.0, drift_sd_annual, n_paths), -0.5, 0.5)
+        off = annual_to_daily_drift(base + eps) - annual_to_daily_drift(base)
+    # Stochastic vol state.
+    use_sv = sv_logvol_sd > 0
+    if use_sv:
+        x = rng.normal(0.0, sv_logvol_sd, n_paths)
+        nu = sv_logvol_sd * np.sqrt(1.0 - sv_persistence ** 2)
+        rho = sv_leverage
+        rho_c = np.sqrt(max(0.0, 1.0 - rho ** 2))
+        var_adj = sv_logvol_sd ** 2
+
     res = SimulationResult(spot=float(spot), horizons=horizons, terminal={}, path_min={}, path_max={},
                            index_terminal={}, rf_growth={}, fan=fan, n_paths=n_paths)
     hset = set(horizons)
     for t in range(T):
         z = skewed_standardized_t(rng, dof, skew_gamma, n_paths)
-        r = mu_d[t] + sig_d[t] * z
+        if use_sv:
+            r = mu_d[t] + off + sig_d[t] * np.exp(x - var_adj) * z
+            x = sv_persistence * x + nu * (rho * z + rho_c * rng.normal(0.0, 1.0, n_paths))
+        else:
+            r = mu_d[t] + off + sig_d[t] * z
         np.clip(r, -max_daily_move, max_daily_move, out=r)
         r_etf = leverage * r - daily_cost
         if tracking_sd_daily > 0:

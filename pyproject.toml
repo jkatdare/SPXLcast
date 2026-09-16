@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spxlcast"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fundamentals-driven price distribution forecast, rating and price percentiles for SPXL (3x S&P 500)"
 requires-python = ">=3.10"
 dependencies = [

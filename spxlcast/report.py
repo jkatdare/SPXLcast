@@ -302,6 +302,47 @@ def render_news(fc: Forecast, console: Console, max_items: int = 5) -> None:
         console.print(t)
 
 
+def render_score(rep, console: Console, path: str) -> None:
+    """Track-record scoring (see tracklog.score_log)."""
+    head = Text()
+    head.append(f"{rep.n_rows} logged forecast dates", style="bold")
+    if rep.first_date:
+        head.append(f"  {rep.first_date} to {rep.last_date}")
+    head.append(f"   |   {rep.n_scoreable} scoreable so far   |   {path}")
+    console.print(Panel(head, title="Track record", box=box.ROUNDED))
+    for n in rep.notes:
+        console.print(f"[yellow]note:[/yellow] {n}")
+    if not rep.horizons:
+        return
+    t = Table(title="Realised outcomes vs the forecast distribution (targets: mean PIT 0.50, "
+                    "5-95 band 90%, 25-75 band 50%, tails 5% each)", box=box.SIMPLE_HEAVY)
+    for c in ("Horizon", "n", "Mean PIT", "In 5-95", "In 25-75", "Below 5", "Above 95",
+              "Real mean ret", "Pred median ret", "P(dd20) pred/real", "P(up20) pred/real"):
+        t.add_column(c, justify="right")
+    for hs in rep.horizons:
+        t.add_row(horizon_label(hs.horizon), str(hs.n), f"{hs.mean_pit:.2f}", pct(hs.cov_5_95, 0, False),
+                  pct(hs.cov_25_75, 0, False), pct(hs.frac_below_5, 0, False), pct(hs.frac_above_95, 0, False),
+                  pct(hs.mean_realised_return), pct(hs.mean_predicted_median_return),
+                  f"{hs.pred_dd20:.0%}/{hs.real_dd20:.0%}", f"{hs.pred_up20:.0%}/{hs.real_up20:.0%}")
+    console.print(t)
+    console.print("[dim]PIT = where the realised price fell in the predicted distribution (0 = below everything, "
+                  "1 = above everything). A mean far from 0.5 is bias; band coverage far from target is mis-sized "
+                  "dispersion. Overlapping windows make these estimates noisier than the counts suggest.[/dim]")
+    if rep.by_rating:
+        t = Table(title="Realised return at the rating horizon, by rating given", box=box.SIMPLE)
+        for c in ("Rating", "n", "Mean realised return", "P(positive)"):
+            t.add_column(c, justify="right")
+        for label in ("BUY", "HOLD", "SELL"):
+            if label in rep.by_rating:
+                r = rep.by_rating[label]
+                t.add_row(label, str(r["n"]), pct(r["mean_return"]), pct(r["p_positive"], 0, False))
+        console.print(t)
+    if rep.sentiment_n:
+        corr = "n/a (fewer than 10 pairs)" if rep.sentiment_corr is None else f"{rep.sentiment_corr:+.2f}"
+        console.print(f"News score vs next-10-session SPXL return: correlation {corr} over {rep.sentiment_n} dates. "
+                      f"[dim]A value near zero means the news tilt has no predictive content and can stay informational.[/dim]")
+
+
 def render_notes(fc: Forecast, console: Console) -> None:
     for n in fc.snap.notes:
         console.print(f"[yellow]note:[/yellow] {n}")

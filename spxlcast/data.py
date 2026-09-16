@@ -20,6 +20,7 @@ import yfinance as yf
 
 from .cache import Cache
 from .config import FRED_SERIES, MARKET_TICKERS, Config
+from .env import fred_api_key
 
 log = logging.getLogger(__name__)
 NY_TZ = "America/New_York"
@@ -341,7 +342,27 @@ def fetch_news(tickers: List[str], cache: Cache, ttl_hours: float, workers: int 
 # ---------------------------------------------------------------------------------------
 # FRED (optional)
 # ---------------------------------------------------------------------------------------
-def _fred_one(series_id: str, timeout: float) -> Optional[pd.Series]:
+def _fred_api(series_id: str, timeout: float, api_key: str, years: int = 6) -> Optional[pd.Series]:
+    """Official FRED API (needs a free key). Missing observations are reported as '.'."""
+    start = (datetime.now(timezone.utc) - pd.Timedelta(days=365 * years)).strftime("%Y-%m-%d")
+    resp = requests.get(
+        "https://api.stlouisfed.org/fred/series/observations",
+        params={"series_id": series_id, "api_key": api_key, "file_type": "json", "observation_start": start},
+        timeout=timeout, headers={"User-Agent": "Mozilla/5.0 spxlcast"},
+    )
+    resp.raise_for_status()
+    obs = resp.json().get("observations", [])
+    if not obs:
+        return None
+    df = pd.DataFrame(obs)[["date", "value"]]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    s = df.dropna().set_index("date")["value"]
+    return s if len(s) else None
+
+
+def _fred_csv(series_id: str, timeout: float) -> Optional[pd.Series]:
+    """Key-less chart endpoint; blocked on some networks, kept as the fallback."""
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 spxlcast"})
     resp.raise_for_status()
@@ -357,7 +378,14 @@ def _fred_one(series_id: str, timeout: float) -> Optional[pd.Series]:
     return s if len(s) else None
 
 
-def fetch_fred(series_ids: List[str], cache: Cache, ttl_hours: float, timeout: float) -> Dict[str, pd.Series]:
+def _fred_one(series_id: str, timeout: float, api_key: Optional[str] = None) -> Optional[pd.Series]:
+    if api_key:
+        return _fred_api(series_id, timeout, api_key)
+    return _fred_csv(series_id, timeout)
+
+
+def fetch_fred(series_ids: List[str], cache: Cache, ttl_hours: float, timeout: float,
+               api_key: Optional[str] = None) -> Dict[str, pd.Series]:
     out: Dict[str, pd.Series] = {}
     pending = []
     for sid in series_ids:
@@ -369,7 +397,7 @@ def fetch_fred(series_ids: List[str], cache: Cache, ttl_hours: float, timeout: f
     if not pending:
         return out
     with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
-        futures = {pool.submit(_fred_one, sid, timeout): sid for sid in pending}
+        futures = {pool.submit(_fred_one, sid, timeout, api_key): sid for sid in pending}
         for fut in as_completed(futures):
             sid = futures[fut]
             try:
@@ -425,11 +453,12 @@ def load_market(cfg: Config) -> MarketSnapshot:
     snap.infos = fetch_infos(info_tickers, cache, cfg.info_ttl_hours)
 
     if cfg.use_fred:
-        snap.fred = fetch_fred(list(FRED_SERIES.keys()), cache, cfg.info_ttl_hours, cfg.fred_timeout)
+        key = fred_api_key()
+        snap.fred = fetch_fred(list(FRED_SERIES.keys()), cache, cfg.info_ttl_hours, cfg.fred_timeout, api_key=key)
         got = sorted(snap.fred.keys())
         if not got:
-            snap.notes.append("FRED unreachable: using Yahoo yields and default inflation; "
-                              "credit/labour/CPI signals skipped")
+            snap.notes.append(("FRED unreachable" if key else "FRED unreachable and no FRED_API_KEY set")
+                              + ": using Yahoo yields and default inflation; credit/labour/CPI signals skipped")
         elif len(got) < len(FRED_SERIES):
             snap.notes.append("FRED partial: missing " + ", ".join(s for s in FRED_SERIES if s not in got))
 

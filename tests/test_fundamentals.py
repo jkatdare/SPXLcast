@@ -48,8 +48,13 @@ def test_expected_return_blend_without_adjustments():
     assert e.adjustments == {}
 
 
+def test_valuation_term_is_off_by_default():
+    e = expected_index_return(_fund(ey=0.035), _macro(), Config())
+    assert "valuation" not in e.adjustments
+
+
 def test_valuation_term_is_countercyclical_and_absolute():
-    cfg = Config()
+    cfg = Config(valuation_sensitivity=0.5)
     neutral = expected_index_return(_fund(ey=cfg.neutral_earnings_yield), _macro(), cfg)
     assert abs(neutral.adjustments["valuation"]) < 1e-12
     cheap = expected_index_return(_fund(ey=0.09), _macro(), cfg)
@@ -64,7 +69,7 @@ def test_valuation_term_is_countercyclical_and_absolute():
 
 
 def test_regime_penalties_are_small_and_capped():
-    cfg = Config()
+    cfg = Config(valuation_sensitivity=0.5)
     neutral = expected_index_return(_fund(), _macro(), cfg)
     inverted = expected_index_return(_fund(), _macro(curve_10y_3m=-0.012), cfg)
     stressed = expected_index_return(_fund(), _macro(hy_oas=0.07), cfg)
@@ -96,9 +101,9 @@ def test_vol_term_structure_matches_pillars_with_tenor_haircuts():
     assert len(vts.daily) == 252
     assert np.all(vts.daily >= cfg.vol_floor)
     h1, h3, h6 = cfg.vrp_vol_points
-    assert vts.pillars[21] == (18.0 - h1) / 100.0
-    assert vts.pillars[63] == (20.0 - h3) / 100.0
-    assert vts.pillars[126] == (21.0 - h6) / 100.0
+    assert abs(vts.pillars[21] - (18.0 - h1) / 100.0) < 1e-12
+    assert abs(vts.pillars[63] - (20.0 - h3) / 100.0) < 1e-12
+    assert abs(vts.pillars[126] - (21.0 - h6) / 100.0) < 1e-12
     for h, s in vts.pillars.items():   # total vol to each pillar reproduces the haircut implied vol
         assert abs(vts.total_vol(h) - s) < 1e-9
 

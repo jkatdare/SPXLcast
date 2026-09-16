@@ -249,11 +249,12 @@ def expected_index_return(fund: IndexFundamentals, macro: MacroState, cfg: Confi
         return ExpectedReturn(m_ey, m_dg, base, adj, final, notes)
 
     if cfg.use_macro_adjustments:
-        a = float(np.clip((fund.earnings_yield - cfg.neutral_earnings_yield) * cfg.valuation_sensitivity,
-                          -cfg.valuation_adj_cap, cfg.valuation_adj_cap))
-        adj["valuation"] = a
-        notes.append(f"E/P {fund.earnings_yield:.2%} vs neutral {cfg.neutral_earnings_yield:.2%} "
-                     f"(P/E {1 / fund.earnings_yield:.1f} vs {1 / cfg.neutral_earnings_yield:.0f})")
+        if cfg.valuation_sensitivity > 0 and fund.earnings_yield > 0:
+            a = float(np.clip((fund.earnings_yield - cfg.neutral_earnings_yield) * cfg.valuation_sensitivity,
+                              -cfg.valuation_adj_cap, cfg.valuation_adj_cap))
+            adj["valuation"] = a
+            notes.append(f"E/P {fund.earnings_yield:.2%} vs neutral {cfg.neutral_earnings_yield:.2%} "
+                         f"(P/E {1 / fund.earnings_yield:.1f} vs {1 / cfg.neutral_earnings_yield:.0f})")
 
         regime: Dict[str, float] = {}
         if macro.curve_10y_3m is not None and macro.curve_10y_3m < 0:

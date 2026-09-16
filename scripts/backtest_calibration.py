@@ -40,11 +40,15 @@ HORIZONS = [21, 63, 126]
 TOUCH = {"dn10": 0.90, "dn20": 0.80, "up10": 1.10, "up20": 1.20}
 TICKERS = ["SPXL", "SPY", "^VIX", "^VIX3M", "^VIX6M", "^IRX"]
 
-# name -> (vrp haircuts, dof, skew gamma, swap spread)
+# name -> dict of Config overrides (the empty dict is the current default configuration)
+NO_SV = dict(sv_persistence=0.0, sv_logvol_sd=0.0, sv_leverage=0.0)
 VARIANTS = {
-    "previous (vrp 2 flat, symmetric, spread 0.40%)": (2.0, 4.0, 1.0, 0.004),
-    "current  (vrp 2/4/6, skew 0.9, spread 0.75%)": ((2.0, 4.0, 6.0), 4.0, 0.9, 0.0075),
-    "current without skew": ((2.0, 4.0, 6.0), 4.0, 1.0, 0.0075),
+    "v1: flat vrp 2, symmetric, spread 0.40%, no SV": dict(vrp_vol_points=2.0, skew_gamma=1.0, swap_spread=0.004,
+                                                           drift_uncertainty_sd=0.0, **NO_SV),
+    "v2: vrp 2/4/6, skew 0.9, no SV": dict(vrp_vol_points=(2.0, 4.0, 6.0), drift_uncertainty_sd=0.0, **NO_SV),
+    "v2 + drift sd 2%": dict(vrp_vol_points=(2.0, 4.0, 6.0), **NO_SV),
+    "current default: SV + vrp 3/5/7 + drift sd 2%": dict(),
+    "current with symmetric shocks": dict(skew_gamma=1.0),
 }
 
 
@@ -86,21 +90,23 @@ def run(drift: float, n_paths: int, years: int, out_dir: Path) -> pd.DataFrame:
           f"{n_paths} paths")
     rows = []
     t0 = time.time()
-    for vname, (vrp, dof, gamma, spread) in VARIANTS.items():
-        cfg = Config(use_fred=False, use_news=False, vrp_vol_points=vrp, t_dof=dof, skew_gamma=gamma, swap_spread=spread)
+    for vname, overrides in VARIANTS.items():
+        cfg = Config(use_fred=False, use_news=False, **overrides)
+        engine = dict(dof=cfg.t_dof, skew_gamma=cfg.skew_gamma, seed=42, drift_sd_annual=cfg.drift_uncertainty_sd,
+                      sv_persistence=cfg.sv_persistence, sv_logvol_sd=cfg.sv_logvol_sd, sv_leverage=cfg.sv_leverage)
         for pos in positions:
             row = df.iloc[pos]
             macro = macro_at(row)
             snap = MarketSnapshot(asof=datetime.now(timezone.utc),
                                   prices={"SPY": pd.DataFrame({"Close": df["SPY"].iloc[: pos + 1]})})
             vol = vol_term_structure(macro, snap, cfg, max(HORIZONS))
-            cost = cfg.expense_ratio_default + 2.0 * (macro.rf_3m + spread)
+            cost = cfg.expense_ratio_default + 2.0 * (macro.rf_3m + cfg.swap_spread)
             mu = np.full(max(HORIZONS), drift)
             sims = {
                 "SPXL": simulate(float(row["SPXL"]), mu, vol.daily, 3.0, cost / 252.0, 0.0, macro.rf_3m, HORIZONS,
-                                 n_paths=n_paths, dof=dof, skew_gamma=gamma, seed=42),
+                                 n_paths=n_paths, **engine),
                 "SPY": simulate(float(row["SPY"]), mu, vol.daily, 1.0, 0.0, 0.0, macro.rf_3m, HORIZONS,
-                                n_paths=n_paths, dof=dof, skew_gamma=gamma, seed=42),
+                                n_paths=n_paths, **engine),
             }
             for asset, sim in sims.items():
                 for h in HORIZONS:

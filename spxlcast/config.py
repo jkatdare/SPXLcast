@@ -27,12 +27,21 @@ class Config:
     t_dof: float = 4.0                # Student-t degrees of freedom for daily index shocks (fat tails)
     skew_gamma: float = 0.9           # Fernandez-Steel skew of the daily shock; 1.0 = symmetric, <1 = negative skew
     max_daily_move: float = 0.20      # index circuit-breaker: a single day cannot move more than +/-20%
+    drift_uncertainty_sd: float = 0.02   # sd of the per-path expected index return (0 = drift treated as known)
+    # Stochastic volatility (backtested 2016-2026 with the haircuts below): vol clustering with a
+    # leverage effect fixes the shape of the distribution and the drawdown-touch probabilities.
+    sv_persistence: float = 0.97      # AR(1) persistence of the log-vol deviation (0 = off)
+    sv_logvol_sd: float = 0.35        # stationary sd of the log-vol deviation (0 = off)
+    sv_leverage: float = -0.5         # corr(today's return shock, tomorrow's vol innovation)
 
     # --- Expected-return model for the S&P 500 (annualised, nominal, total return) -------
     long_run_real_eps_growth: float = 0.03     # real per-share earnings growth; nominal = this + expected inflation
     expected_inflation_default: float = 0.025  # used when a market breakeven is unavailable
+    # Optional countercyclical valuation term, 0.5 x (E/P - neutral) capped. Off by default: over
+    # 1881-2023 (scripts/backtest_drift.py) it added no predictive value to the blend and biased the
+    # post-1990 era low, because the market re-rated to structurally higher valuations.
     neutral_earnings_yield: float = 0.05       # trailing E/P at which the valuation term is zero (P/E 20)
-    valuation_sensitivity: float = 0.5         # drift adj per 1.00 of E/P deviation from neutral (capped below)
+    valuation_sensitivity: float = 0.0         # drift adj per 1.00 of E/P deviation from neutral (0 = off)
     valuation_adj_cap: float = 0.015
     # Risk-regime descriptors. They are small and capped in total: at a 6-month horizon these signals
     # describe risk, they do not forecast returns (inverted curves and wide spreads often precede rallies).
@@ -49,8 +58,9 @@ class Config:
 
     # --- Volatility -------------------------------------------------------------------
     # Implied vol exceeds subsequently realised vol by more at longer tenors (variance risk premium):
-    # haircut in vol points for the 1-month, 3-month and 6-month pillars. Backtested 2016-2026.
-    vrp_vol_points: Tuple[float, float, float] = (2.0, 4.0, 6.0)
+    # haircut in vol points for the 1-month, 3-month and 6-month pillars. Backtested 2016-2026
+    # together with the stochastic-vol settings above (with stochastic vol off, 2/4/6 fits better).
+    vrp_vol_points: Tuple[float, float, float] = (3.0, 5.0, 7.0)
     vol_floor: float = 0.08
     long_run_vol: float = 0.16        # S&P 500 long-run annualised vol, used beyond the VIX curve
     max_stale_sessions: int = 5       # ignore a market series whose last observation is older than this

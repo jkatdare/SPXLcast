@@ -1,0 +1,42 @@
+# Azure Container Apps Job: runs infra/daily.sh every weekday after the US close.
+# Placeholders in ${...} are filled in by infra/deploy.ps1 (or by hand).
+location: ${LOCATION}
+name: ${JOB_NAME}
+properties:
+  environmentId: ${ENV_ID}
+  configuration:
+    triggerType: Schedule
+    replicaTimeout: 1500          # seconds; a run takes about a minute, the cap protects against hangs
+    replicaRetryLimit: 1
+    scheduleTriggerConfig:
+      cronExpression: "${CRON}"  # UTC. 21:40 UTC = 17:40 EDT / 16:40 EST, after the close all year
+      parallelism: 1
+      replicaCompletionCount: 1
+    registries:
+      - server: ${ACR_SERVER}
+        username: ${ACR_USER}
+        passwordSecretRef: acr-password
+    secrets:
+      - name: acr-password
+        value: ${ACR_PASSWORD}
+      - name: fred-key
+        value: ${FRED_API_KEY}
+  template:
+    containers:
+      - name: ${JOB_NAME}
+        image: ${ACR_SERVER}/spxlcast:latest
+        resources:
+          cpu: 1.0
+          memory: 2Gi
+        env:
+          - name: SPXLCAST_DATA
+            value: /data
+          - name: FRED_API_KEY
+            secretRef: fred-key
+        volumeMounts:
+          - volumeName: data
+            mountPath: /data
+    volumes:
+      - name: data
+        storageType: AzureFile
+        storageName: data           # the environment storage created by deploy.ps1 (the file share)

@@ -49,6 +49,36 @@ def test_skew_does_not_change_the_mean():
     assert abs(res.index_terminal[252].mean() - 1.07) < 0.01
 
 
+def test_drift_uncertainty_widens_without_moving_the_mean():
+    T = 252
+    kw = dict(spot=100.0, mu_annual=np.full(T, 0.07), sigma_annual=np.full(T, 0.16), leverage=1.0,
+              daily_cost=0.0, tracking_sd_daily=0.0, rf_annual=0.04, horizons=[252], n_paths=40_000, seed=5)
+    known = simulate(**kw)
+    unsure = simulate(**kw, drift_sd_annual=0.03)
+    assert abs(unsure.index_terminal[252].mean() - 1.07) < 0.01
+    sd_known = np.log(known.index_terminal[252]).std()
+    sd_unsure = np.log(unsure.index_terminal[252]).std()
+    assert sd_unsure > sd_known
+    assert abs(sd_unsure ** 2 - (sd_known ** 2 + 0.03 ** 2)) < 0.004   # variances add
+
+
+def test_stochastic_vol_preserves_average_variance_and_adds_skew():
+    from scipy import stats
+    T = 252
+    kw = dict(spot=100.0, mu_annual=np.full(T, 0.0), sigma_annual=np.full(T, 0.16), leverage=1.0,
+              daily_cost=0.0, tracking_sd_daily=0.0, rf_annual=0.0, horizons=[21, 252], n_paths=40_000,
+              dof=8.0, seed=6)
+    plain = simulate(**kw)
+    sv = simulate(**kw, sv_persistence=0.97, sv_logvol_sd=0.35, sv_leverage=-0.5)
+    r_plain = np.log(plain.index_terminal[252])
+    r_sv = np.log(sv.index_terminal[252])
+    assert abs(r_sv.std() / r_plain.std() - 1.0) < 0.06          # same variance on average
+    assert stats.skew(r_sv) < stats.skew(r_plain) - 0.1          # leverage effect adds downside skew
+    assert stats.kurtosis(np.log(sv.index_terminal[21])) > stats.kurtosis(np.log(plain.index_terminal[21]))
+    with pytest.raises(ValueError):
+        simulate(**kw, sv_persistence=1.0, sv_logvol_sd=0.3)
+
+
 def test_leveraged_median_shows_volatility_decay(sim):
     # log-median of a 3x fund ~ 3*ln(1.07) - cost - 0.5*9*sigma^2 (approx.)
     expected_log = 3 * np.log(1.07) - 0.10 - 0.5 * 9 * 0.16 ** 2

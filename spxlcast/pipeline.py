@@ -99,7 +99,8 @@ def run_forecast(cfg: Config) -> Forecast:
             spot=spot, mu_annual=mu_path, sigma_annual=vol.daily, leverage=etf.leverage,
             daily_cost=etf.daily_cost, tracking_sd_daily=etf.tracking_sd_daily, rf_annual=macro.rf_3m,
             horizons=horizons, n_paths=cfg.n_paths, dof=cfg.t_dof, skew_gamma=cfg.skew_gamma,
-            max_daily_move=cfg.max_daily_move, seed=cfg.seed,
+            max_daily_move=cfg.max_daily_move, seed=cfg.seed, drift_sd_annual=cfg.drift_uncertainty_sd,
+            sv_persistence=cfg.sv_persistence, sv_logvol_sd=cfg.sv_logvol_sd, sv_leverage=cfg.sv_leverage,
         )
 
     sim = _simulate(mu)
