@@ -1,4 +1,4 @@
-# SPXLcast
+spxlcast.com
 
 Fundamentals-driven price forecast for **SPXL** (Direxion Daily S&P 500 Bull 3X), with a
 **Buy / Hold / Sell** rating and a **percentile lookup** for any price level.
