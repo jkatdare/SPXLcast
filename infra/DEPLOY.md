@@ -263,10 +263,16 @@ $objId  = az ad app show --id $appId --query id -o tsv
 az ad sp create --id $appId -o none
 Start-Sleep 30      # let the new principal propagate before assigning a role
 az role assignment create --assignee $appId --role Contributor --scope "/subscriptions/$sub/resourceGroups/spxlcast-rg" -o none
+# The subject must match the token GitHub presents *exactly*. Repositories with the immutable
+# subject setting (the default for new repos) embed the owner and repo IDs; read the prefix with
+#   gh api repos/jkatdare/SPXLcast/actions/oidc/customization/sub
+# and append ":ref:refs/heads/master". Classic repos present "repo:jkatdare/SPXLcast:ref:refs/heads/master".
+$prefix = (gh api repos/jkatdare/SPXLcast/actions/oidc/customization/sub | ConvertFrom-Json).sub_claim_prefix
+if (-not $prefix) { $prefix = "repo:jkatdare/SPXLcast" }
 @"
 { "name": "spxlcast-master",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:jkatdare/SPXLcast:ref:refs/heads/master",
+  "subject": "$($prefix):ref:refs/heads/master",
   "audiences": ["api://AzureADTokenExchange"] }
 "@ | Set-Content "$env:TEMP\fc.json" -Encoding ascii
 az ad app federated-credential create --id $objId --parameters "$env:TEMP\fc.json" -o none
@@ -275,7 +281,9 @@ gh secret set AZURE_TENANT_ID --body $tenant
 gh secret set AZURE_SUBSCRIPTION_ID --body $sub
 ```
 
-Then push the workflow file and watch it: `gh run watch`. The workflow tags each image with the
+Then push the workflow file and watch it: `gh run watch`. A login failure `AADSTS700213: No matching
+federated identity record found for presented assertion subject '...'` means the subject differs from
+the one in the error message; create another credential with that exact subject. The workflow tags each image with the
 commit hash and updates both apps to it, so a rollback is `az containerapp job update ... --image
 spxlcastacr.azurecr.io/spxlcast:<older sha>`. Contributor on the resource group is the minimum
 that lets it build in the registry and update the apps; it cannot touch anything outside

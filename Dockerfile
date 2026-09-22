@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     SPXLCAST_DATA=/data \
-    MPLBACKEND=Agg \n    SPXLCAST_LIVE=1
+    MPLBACKEND=Agg \
+    SPXLCAST_LIVE=1
 
 WORKDIR /app
 COPY requirements.txt pyproject.toml ./

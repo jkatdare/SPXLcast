@@ -57,6 +57,8 @@ jobs:
           az extension add --name containerapp --upgrade -o none
           SERVER=$(az acr show -n "$ACR_NAME" --query loginServer -o tsv)
           IMAGE="$SERVER/spxlcast:${GITHUB_SHA}"
-          az containerapp job update -n "$JOB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \n              --cron-expression "$CRON" --replica-retry-limit 2 -o none
-          az containerapp update -n "$WEB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \n              --min-replicas 1 --max-replicas 1 --set-env-vars SPXLCAST_LIVE=1 -o none
+          az containerapp job update -n "$JOB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \
+              --cron-expression "$CRON" --replica-retry-limit 2 -o none
+          az containerapp update -n "$WEB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \
+              --min-replicas 1 --max-replicas 1 --set-env-vars SPXLCAST_LIVE=1 -o none
           echo "deployed $IMAGE"
