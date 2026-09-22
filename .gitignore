@@ -8,3 +8,4 @@ output/
 .env
 *.env
 logs/*.tmp
+logs/spot_log.csv

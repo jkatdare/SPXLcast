@@ -143,10 +143,15 @@ before it has anything to report.
 
 ## Hosting the daily run on Azure
 
-`infra/deploy.ps1` creates a scheduled Container Apps Job that runs the forecast every weekday at
-21:40 UTC (after the US close all year), appends to the track record on an Azure Files share and
-rescores it, plus a scale-to-zero web app that serves a status page (latest report, fan chart,
-score, CSV/JSON downloads). The job and the web app are defined in `infra/job.yaml` and
+`infra/deploy.ps1` creates a scheduled Container Apps Job that runs the forecast hourly through
+the US session plus once after the close (13:40 to 21:40 UTC, weekdays), appends to the track
+record on an Azure Files share and rescores it, plus an always-on web app that serves a status
+page (latest report, fan chart, score, CSV/JSON downloads). Intraday runs give a live rating and
+price percentiles; the after-close run is the one the track record keeps. Between full runs the
+web app re-prices the latest forecast at the live SPXL quote every minute of the session (the
+simulated distribution is one of returns, so prices scale with the quote and the fixed price
+checks are re-read off stored percentile grids), shows that at the top of the page and records
+the quote in `logs/spot_log.csv`. The job and the web app are defined in `infra/job.yaml` and
 `infra/web.yaml`; the image is built in the cloud by Azure Container Registry, so no local Docker
 is needed. From the repo root after `az login`:
 
@@ -156,9 +161,10 @@ is needed. From the repo root after `az login`:
 ```
 
 The FRED key is read from `.env` or the `FRED_API_KEY` environment variable and stored as a
-Container Apps secret. Approximate cost: the registry (Basic, about $5 a month) dominates; the job
-runs for about a minute a day and the web app scales to zero. `az group delete -n spxlcast-rg`
-removes everything. `python -m spxlcast serve --root DIR` runs the same status page locally.
+Container Apps secret. Approximate cost: the registry (Basic, about $5 a month) and the always-on
+web app (about $14 a month) are the fixed charges; the hourly job costs under $1 a month. `az group delete -n spxlcast-rg`
+removes everything. `python -m spxlcast serve --root DIR [--live]` runs the same status page
+(and, with `--live`, the minute loop) locally.
 To run the steps by hand instead of through the script, follow `infra/DEPLOY.md`.
 
 ## Data notes

@@ -1,5 +1,6 @@
 # Azure Container App: the read-only status page (latest report, chart, score, downloads).
-# Scales to zero when nobody is looking. Placeholders in ${...} are filled in by infra/deploy.ps1.
+# Always on (one replica): it re-prices the forecast at the live quote every minute of the session.
+# Placeholders in ${...} are filled in by infra/deploy.ps1.
 location: ${LOCATION}
 name: ${WEB_NAME}
 properties:
@@ -21,18 +22,20 @@ properties:
     containers:
       - name: ${WEB_NAME}
         image: ${ACR_SERVER}/spxlcast:latest
-        command: ["python", "-m", "spxlcast", "serve", "--root", "/data", "--port", "8000"]
+        command: ["python", "-m", "spxlcast", "serve", "--root", "/data", "--port", "8000", "--live"]
         resources:
           cpu: 0.25
           memory: 0.5Gi
         env:
           - name: SPXLCAST_DATA
             value: /data
+          - name: SPXLCAST_LIVE
+            value: "1"
         volumeMounts:
           - volumeName: data
             mountPath: /data
     scale:
-      minReplicas: 0
+      minReplicas: 1              # always on: the live minute loop runs inside this container
       maxReplicas: 1
     volumes:
       - name: data

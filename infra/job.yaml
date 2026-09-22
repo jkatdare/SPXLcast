@@ -7,9 +7,9 @@ properties:
   configuration:
     triggerType: Schedule
     replicaTimeout: 1500          # seconds; a run takes about a minute, the cap protects against hangs
-    replicaRetryLimit: 1
+    replicaRetryLimit: 2          # a run that never gets a replica (seen once) is retried
     scheduleTriggerConfig:
-      cronExpression: "${CRON}"  # UTC. 21:40 UTC = 17:40 EDT / 16:40 EST, after the close all year
+      cronExpression: "${CRON}"  # UTC, hourly at :40 from 13:40 to 21:40 = the US session plus one run after the close, summer and winter
       parallelism: 1
       replicaCompletionCount: 1
     registries:

@@ -93,7 +93,8 @@ class Config:
     # --- Data ------------------------------------------------------------------------
     history_period: str = "5y"
     cache_dir: str = ".cache"
-    price_ttl_hours: float = 6.0
+    price_ttl_hours: float = 6.0           # after the close (the key also changes at the bell)
+    price_ttl_hours_open: float = 0.5      # while the session is open, so hourly runs see a fresh quote
     info_ttl_hours: float = 12.0
     news_ttl_hours: float = 1.0
     use_fred: bool = True

@@ -429,7 +429,9 @@ def load_market(cfg: Config) -> MarketSnapshot:
         top_symbols = [s for s in snap.holdings["symbol"].tolist()[: cfg.news_holdings_top_n]]
 
     tickers = list(dict.fromkeys(list(MARKET_TICKERS.keys()) + top_symbols))
-    snap.prices, price_time = fetch_prices(tickers, cfg.history_period, cache, cfg.price_ttl_hours,
+    ny_date, is_open = session_state()
+    price_ttl = cfg.price_ttl_hours_open if is_open else cfg.price_ttl_hours
+    snap.prices, price_time = fetch_prices(tickers, cfg.history_period, cache, price_ttl,
                                            required=(cfg.etf, cfg.index_etf))
     snap.fetched_at["prices"] = _utc(price_time)
     missing = [t for t in tickers if t not in snap.prices]
@@ -445,7 +447,6 @@ def load_market(cfg: Config) -> MarketSnapshot:
                 df = snap.prices[t]
                 snap.prices[t] = df[df.index.isin(snap.calendar)]
     # Is the latest bar a live, partial session?
-    ny_date, is_open = session_state()
     last = snap.last_date(cfg.etf)
     snap.intraday = bool(last is not None and str(last.date()) == ny_date and is_open)
 

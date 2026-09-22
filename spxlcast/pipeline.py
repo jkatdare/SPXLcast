@@ -13,6 +13,7 @@ from .etf import ETFParams, build_etf_params
 from .fundamentals import (ExpectedReturn, IndexFundamentals, MacroState, Sensitivity, VolTermStructure,
                            build_fundamentals, build_macro, expected_index_return, expected_inflation,
                            influencer_sensitivities, vol_term_structure)
+from .live import GRID_PERCENTILES
 from .montecarlo import SimulationResult, simulate
 from .rating import Rating, rate
 from .sentiment import SentimentResult, analyze_news
@@ -171,7 +172,13 @@ def forecast_to_dict(fc: Forecast, prices: Optional[List[float]] = None) -> Dict
             "mean_return": fc.rating.mean_return, "reasons": fc.rating.reasons,
         },
         "forecast": {str(h): {**sim.summary(h), "quantile_prices": sim.quantiles(h),
-                              "path_min_quantile_prices": sim.path_min_quantiles(h)} for h in sim.horizons},
+                              "path_min_quantile_prices": sim.path_min_quantiles(h),
+                              # fine grids so the live layer can re-price any level without re-simulating
+                              "grid": {"percentiles": list(GRID_PERCENTILES),
+                                       "terminal": np.percentile(sim.terminal[h], GRID_PERCENTILES).tolist(),
+                                       "path_min": np.percentile(sim.path_min[h], GRID_PERCENTILES).tolist(),
+                                       "path_max": np.percentile(sim.path_max[h], GRID_PERCENTILES).tolist()}}
+                     for h in sim.horizons},
         "drivers": {
             "index_expected_return": {
                 "earnings_yield_model": fc.expected.earnings_yield_model,

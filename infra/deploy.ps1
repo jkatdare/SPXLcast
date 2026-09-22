@@ -1,14 +1,14 @@
 <#
-Deploy SPXLcast to Azure: a scheduled Container Apps Job runs the forecast every weekday after the
-US close and appends to the track record on an Azure Files share; a scale-to-zero Container App
-serves a status page with the latest report, chart, score and downloads.
+Deploy SPXLcast to Azure: a scheduled Container Apps Job runs the forecast hourly through the US session
+(plus once after the close) and appends to the track record on an Azure Files share; an always-on Container App
+serves a status page and re-prices the forecast at the live quote every minute of the session.
 
 Resources (one resource group):
   1. Azure Container Registry (Basic)          builds and stores the image (~$5/month, the main cost)
   2. Storage account + file share "spxlcast"   persistent logs, outputs and data cache (pennies)
   3. Container Apps environment (Consumption)  free to exist
-  4. Container Apps Job    <prefix>-daily      infra/job.yaml, cron 40 21 * * 1-5 (UTC)
-  5. Container App         <prefix>-web        infra/web.yaml, external HTTPS, min replicas 0
+  4. Container Apps Job    <prefix>-daily      infra/job.yaml, cron 40 13-21 * * 1-5 (UTC), hourly through the session
+  5. Container App         <prefix>-web        infra/web.yaml, external HTTPS, always on (1 replica)
 
 Usage (PowerShell, from the repo root, after `az login`):
   .\infra\deploy.ps1 -DryRun                      # print every command, change nothing
@@ -20,7 +20,7 @@ param(
     [string]$Prefix = "spxlcast",
     [string]$Location = "eastus2",
     [string]$ResourceGroup = "$Prefix-rg",
-    [string]$Cron = "40 21 * * 1-5",
+    [string]$Cron = "40 13-21 * * 1-5",
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"

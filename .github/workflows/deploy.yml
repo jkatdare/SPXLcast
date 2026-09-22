@@ -25,6 +25,7 @@ env:
   ACR_NAME: spxlcastacr
   JOB_NAME: spxlcast-daily
   WEB_NAME: spxlcast-web
+  CRON: "40 13-21 * * 1-5"   # UTC: hourly through the US session plus one run after the close
 
 jobs:
   test:
@@ -56,6 +57,6 @@ jobs:
           az extension add --name containerapp --upgrade -o none
           SERVER=$(az acr show -n "$ACR_NAME" --query loginServer -o tsv)
           IMAGE="$SERVER/spxlcast:${GITHUB_SHA}"
-          az containerapp job update -n "$JOB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" -o none
-          az containerapp update -n "$WEB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" -o none
+          az containerapp job update -n "$JOB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \n              --cron-expression "$CRON" --replica-retry-limit 2 -o none
+          az containerapp update -n "$WEB_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" \n              --min-replicas 1 --max-replicas 1 --set-env-vars SPXLCAST_LIVE=1 -o none
           echo "deployed $IMAGE"
