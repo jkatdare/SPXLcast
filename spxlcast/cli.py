@@ -64,7 +64,7 @@ def _paths_int(text: str) -> int:
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--price", type=float, action="append", default=None,
                    help="price level to locate in the distribution (repeatable)")
-    p.add_argument("--horizons", type=_positive_int, nargs="+", default=None, help="horizons in trading days (default 21 63 126 252)")
+    p.add_argument("--horizons", type=_positive_int, nargs="+", default=None, help="horizons in trading days (default 5 10 21 63 126 252)")
     p.add_argument("--rating-horizon", type=_positive_int, default=None, help="horizon used for the rating (default 126)")
     p.add_argument("--paths", type=_paths_int, default=None, help="Monte Carlo paths (default 50000)")
     p.add_argument("--seed", type=int, default=None, help="random seed (default 42)")
@@ -82,6 +82,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log-file", dest="log_file", default=None,
                    help=f"append this run's forecast to a track-record CSV (default for `log`/`score`: {DEFAULT_LOG})")
     p.add_argument("--json", dest="json_path", default=None, help="write the full result to a JSON file")
+    p.add_argument("--archive", dest="archive_dir", default=None,
+                   help="archive this run (inputs, simulator arguments, forecast) and its new headlines under DIR")
     p.add_argument("--plot", dest="plot_path", default=None, help="write a fan chart PNG to this path")
     p.add_argument("--quiet", action="store_true", help="only print the rating line")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -97,9 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_pr)
     for name, help_text in (("metrics", "influencer levels, valuation and macro"), ("news", "news sentiment"),
                             ("calibrate", "leveraged-ETF calibration and drivers"),
-                            ("log", "run the forecast quietly and append it to the track-record CSV"),
-                            ("score", "score the track-record CSV against realised prices")):
+                            ("log", "run the forecast quietly and append it to the track-record CSV")):
         _add_common(sub.add_parser(name, help=help_text))
+    p_sc = sub.add_parser("score", help="score the track-record CSV against realised prices")
+    p_sc.add_argument("--model-version", dest="model_version", default=None,
+                      help="score only the rows logged by this model version (default: all, pooled)")
+    _add_common(p_sc)
     return parser
 
 
@@ -173,7 +178,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         console = Console(width=max(console.width, 120))
 
     if args.command == "score":
-        render_score(score_log(args.log_file or DEFAULT_LOG, cfg=cfg), console, args.log_file or DEFAULT_LOG)
+        rep = score_log(args.log_file or DEFAULT_LOG, cfg=cfg, model_version=args.model_version)
+        render_score(rep, console, args.log_file or DEFAULT_LOG)
         return 0
 
     with console.status("Fetching data and simulating...", spinner="dots"):
@@ -182,6 +188,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_file = args.log_file or (DEFAULT_LOG if args.command == "log" else None)
     if log_file:
         append_log(fc, log_file)
+    archived = None
+    if args.archive_dir:
+        from .archive import archive_run
+        try:
+            archived = archive_run(fc, args.archive_dir, prices)
+        except Exception as exc:  # noqa: BLE001 - the forecast and the track record matter more
+            archived = exc
 
     if args.quiet or args.command == "log":
         console.print(f"{cfg.etf} {fc.spot:,.2f} ({fc.spot_status} {fc.spot_date})  rating {fc.rating.label} "
@@ -206,6 +219,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         render_all(fc, console, prices=prices, sections=sections)
         if log_file:
             console.print(f"[dim]appended to {log_file}[/dim]")
+    if isinstance(archived, Exception):
+        console.print(f"[yellow]warning: archive failed: {archived}[/yellow]")
+    elif archived:
+        console.print(f"[dim]archived {archived['run']} ({archived['new_stories']} new stories)[/dim]")
 
     if args.json_path:
         os.makedirs(os.path.dirname(os.path.abspath(args.json_path)), exist_ok=True)

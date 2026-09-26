@@ -49,6 +49,8 @@ def horizon_phrase(horizon: int) -> str:
     if horizon % 21 == 0:
         m = horizon // 21
         return f"{m}-month" if m % 12 else f"{m // 12}-year"
+    if horizon < 21 and horizon % 5 == 0:
+        return f"{horizon // 5}-week"
     return f"{horizon}-day"
 
 

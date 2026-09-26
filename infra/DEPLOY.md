@@ -46,11 +46,13 @@ az group create -n spxlcast-rg -l eastus2 -o none
 
 ```powershell
 az acr create -n spxlcastacr -g spxlcast-rg --sku Basic --admin-enabled true -o none
-az acr build -r spxlcastacr -t spxlcast:latest . -o none
+az acr build -r spxlcastacr -t spxlcast:latest --build-arg "SPXLCAST_BUILD=$(git rev-parse HEAD)" . -o none
 ```
 
 `az acr build` uploads the repo (minus `.dockerignore` entries, so never `.env`) and builds the
-Dockerfile in Azure. Re-run it whenever the code changes, or let the GitHub workflow do it.
+Dockerfile in Azure. Re-run it whenever the code changes, or let the GitHub workflow do it. The
+build argument stamps the image with the git commit, which every logged forecast records in its
+`build` column (without it the column says `unknown`).
 
 ## 3. Storage account and file share
 
@@ -289,10 +291,52 @@ spxlcastacr.azurecr.io/spxlcast:<older sha>`. Contributor on the resource group 
 that lets it build in the registry and update the apps; it cannot touch anything outside
 `spxlcast-rg`.
 
+## 10. Health check and alerts
+
+`.github/workflows/healthcheck.yml` checks the live site from GitHub at 15:05, 17:05, 19:05 and
+22:15 UTC on weekdays (`spxlcast/health.py`, standard library only). It fails when:
+
+- a scheduled job run in the last 3.5 hours never logged a forecast (each run is covered by one or
+  two checks, so a missed run is reported once or twice, never silently);
+- `output/forecast.json` is older than the latest logged run (the run did not finish its outputs);
+- `output/live.json` is more than 10 minutes old during the session (the live loop has stopped);
+- the latest run priced SPXL more than 4 days ago (stale price feed), or `/healthz` is down.
+
+Data problems flagged by the latest run (the `data_flags` column, for example `fred:none`) are
+reported as warnings without failing. On failure it opens an issue labelled `health-check` (later
+failures comment on it), fails the workflow run so GitHub sends its failed-workflow email, and
+closes the issue once a check passes again. Nothing to set up beyond pushing the file; the
+workflow's own token opens the issues. It uses about 90 of the 2,000 free Actions minutes a month.
+Run it by hand with `gh workflow run healthcheck.yml`, or locally:
+
+```powershell
+py -m spxlcast.health --url https://spxlcast.com
+```
+
+## Archive
+
+Every job run also writes, on the file share under `archive/`:
+
+- `runs/YYYY-MM-DD/HHMMSSZ.json.gz`: the run's inputs (latest market and FRED values, holdings,
+  data flags, package versions), the exact simulator arguments and the full forecast. With the same
+  build, `spxlcast.archive.replay(load_run(path))` reproduces the simulation exactly.
+- `news/YYYY-MM.jsonl`: every headline the model scored, once, at its first sighting, with its
+  text, score and relevance. Yahoo only serves the latest headlines, so this is the only history
+  the news tilt can later be calibrated on.
+
+The status page does not serve it (it holds publishers' headline text). Download it with:
+
+```powershell
+$key = az storage account keys list -n spxlcastsa -g spxlcast-rg --query "[0].value" -o tsv
+az storage file download-batch --account-name spxlcastsa --account-key $key -s spxlcast --pattern "archive/*" -d . -o none
+```
+
+It grows by roughly 100 MB a year, well within the 5 GB share.
+
 ## Updating and removing
 
 - Code changes: push to `master` (with the workflow), or by hand
-  `az acr build -r spxlcastacr -t spxlcast:latest . -o none` followed by
+  `az acr build -r spxlcastacr -t spxlcast:latest --build-arg "SPXLCAST_BUILD=$(git rev-parse HEAD)" . -o none` followed by
   `az containerapp job update -n spxlcast-daily -g spxlcast-rg --image spxlcastacr.azurecr.io/spxlcast:latest -o none`
   and the same `az containerapp update` for `spxlcast-web`.
 - Change the schedule: edit `CRON` in `.github/workflows/deploy.yml` and push (or, until the next
@@ -301,11 +345,12 @@ that lets it build in the registry and update the apps; it cannot touch anything
   session; `az containerapp logs show -n spxlcast-web -g spxlcast-rg --tail 50` shows the loop, and
   `az containerapp job execution list -n spxlcast-daily -g spxlcast-rg -o table` the hourly runs.
 - Everything, including the track record on the share: `az group delete -n spxlcast-rg --yes`.
-  Download `forecast_log.csv` from the status page first if you want to keep it.
+  Download `forecast_log.csv` from the status page and the archive (above) first if you want to keep them.
 
 ## Cost
 
 The Basic registry is about $5 a month. The always-on web app (0.25 vCPU, 0.5 GiB) is the other
 fixed charge: roughly $14 a month at consumption prices after the free monthly grant. The job bills
 only while it runs (nine one-minute runs a day, under $1 a month), the 5 GB file share is pennies,
-and GitHub Actions minutes on a private repo are within the free monthly allowance for a few runs.
+and GitHub Actions minutes on a private repo (deploys plus about 90 minutes a month of health
+checks) are within the free monthly allowance.

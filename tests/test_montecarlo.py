@@ -136,3 +136,17 @@ def test_invalid_inputs_are_rejected():
         simulate(100.0, np.zeros(5), np.full(5, 0.2), 3.0, 0.0, 0.0, 0.0, horizons=[5], n_paths=100, skew_gamma=0.0)
     with pytest.raises(ValueError):
         simulate(100.0, np.zeros(5), np.full(5, 0.2), 3.0, 0.0, 0.0, 0.0, horizons=[5], n_paths=100, dof=2.0)
+
+
+def test_extra_horizons_do_not_change_the_other_horizons():
+    """Adding the 1W/2W horizons must not move any existing number (no model-version bump)."""
+    kw = dict(spot=100.0, mu_annual=np.full(63, 0.06), sigma_annual=np.full(63, 0.15), leverage=3.0,
+              daily_cost=0.1 / 252, tracking_sd_daily=0.001, rf_annual=0.04, n_paths=2000, seed=7,
+              dof=4.0, skew_gamma=0.9, drift_sd_annual=0.02, sv_persistence=0.97, sv_logvol_sd=0.35,
+              sv_leverage=-0.5)
+    old = simulate(horizons=[21, 63], **kw)
+    new = simulate(horizons=[5, 10, 21, 63], **kw)
+    for h in (21, 63):
+        assert np.array_equal(old.terminal[h], new.terminal[h])
+        assert np.array_equal(old.path_min[h], new.path_min[h]) and np.array_equal(old.path_max[h], new.path_max[h])
+    assert np.array_equal(old.fan, new.fan)

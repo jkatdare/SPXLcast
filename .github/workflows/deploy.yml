@@ -51,7 +51,8 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Build image in ACR
         run: |
-          az acr build -r "$ACR_NAME" -t "spxlcast:${GITHUB_SHA}" -t "spxlcast:latest" . -o none
+          az acr build -r "$ACR_NAME" -t "spxlcast:${GITHUB_SHA}" -t "spxlcast:latest" \
+              --build-arg "SPXLCAST_BUILD=${GITHUB_SHA}" . -o none
       - name: Roll out to the job and the web app
         run: |
           az extension add --name containerapp --upgrade -o none

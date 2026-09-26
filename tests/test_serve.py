@@ -33,3 +33,12 @@ def test_status_page_and_downloads(tmp_path):
         assert get("/etc/passwd")[0] == 404
     finally:
         server.shutdown()
+
+
+def test_horizon_labels_cover_weeks():
+    from spxlcast.rating import horizon_phrase
+    from spxlcast.report import horizon_label
+    from spxlcast.serve import _horizon_label
+    for fn in (horizon_label, _horizon_label):
+        assert [fn(d) for d in (5, 10, 21, 63, 252, 7, 300)] == ["1W", "2W", "1M", "3M", "1Y", "7d", "300d"]
+    assert horizon_phrase(5) == "1-week" and horizon_phrase(126) == "6-month"

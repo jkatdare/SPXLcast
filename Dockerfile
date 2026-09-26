@@ -14,6 +14,11 @@ COPY scripts ./scripts
 COPY infra/daily.sh ./daily.sh
 RUN chmod +x ./daily.sh && mkdir -p /data/logs /data/output
 
+# The git commit the image is built from (the deploy workflow passes it with --build-arg); it is
+# logged with every forecast. Declared last so a new commit does not invalidate the layers above.
+ARG SPXLCAST_BUILD=unknown
+ENV SPXLCAST_BUILD=${SPXLCAST_BUILD}
+
 # Default command: one daily run (used by the scheduled job). The web app overrides the command
 # with `python -m spxlcast serve --root /data --port 8000`; SPXLCAST_LIVE=1 makes it run the
 # minute-by-minute live loop as well.

@@ -1,0 +1,58 @@
+# Checks the live site on a schedule and opens a GitHub issue when something is wrong: a scheduled
+# run that never logged a forecast, a run that did not finish its outputs, a stale live price during
+# the session, a stale price feed, or the page being down (see spxlcast/health.py). Further failures
+# comment on the same issue, and it is closed automatically once all checks pass again. A failed
+# check also fails this workflow, which triggers GitHub's failed-workflow email.
+name: Health check
+
+on:
+  schedule:
+    - cron: "5 15,17,19 * * 1-5"   # UTC: inside the US session in summer and winter
+    - cron: "15 22 * * 1-5"        # UTC: after the day's last scheduled run (21:40)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: healthcheck
+  cancel-in-progress: false
+
+env:
+  SITE: https://spxlcast.com
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the site
+        id: check
+        continue-on-error: true
+        run: python3 -m spxlcast.health --url "$SITE" --output report.md    # standard library only
+      - name: Open or update the health-check issue
+        if: steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          [ -s report.md ] || echo "The health check crashed; see $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > report.md
+          gh label create health-check --color D93F0B --description "Automated site health check" 2>/dev/null || true
+          num=$(gh issue list --label health-check --state open --json number --jq '.[0].number')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file report.md
+          else
+            gh issue create --title "Site health check failed" --label health-check --body-file report.md
+          fi
+          exit 1
+      - name: Close the health-check issue after recovery
+        if: steps.check.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for num in $(gh issue list --label health-check --state open --json number --jq '.[].number'); do
+            gh issue close "$num" --comment "Recovered: all checks passed at $(date -u '+%Y-%m-%d %H:%M UTC')."
+          done

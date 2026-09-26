@@ -55,6 +55,8 @@ def _horizon_label(days: int) -> str:
     if days % 21 == 0:
         m = days // 21
         return f"{m}M" if m % 12 else f"{m // 12}Y"
+    if days < 21 and days % 5 == 0:
+        return f"{days // 5}W"
     return f"{days}d"
 
 

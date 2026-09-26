@@ -8,6 +8,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
+# Version of the forecasting model, logged with every track-record row so results can be scored per
+# version. Bump it whenever a change alters the numbers a run produces (inputs, assumptions, the
+# simulation, the rating); pure plumbing, reporting or extra horizons do not need a bump.
+MODEL_VERSION = "0.2.0"
+
 
 @dataclass
 class Config:
@@ -18,7 +23,10 @@ class Config:
     leverage_target: float = 3.0      # the fund's stated daily leverage
 
     # --- Horizons (trading days) ----------------------------------------------------
-    horizons: Tuple[int, ...] = (21, 63, 126, 252)
+    # 1W and 2W are logged for fast feedback: ~50 independent weekly outcomes a year against 12
+    # monthly ones, and the news tilt only acts over the first 10 days. Extra horizons do not change
+    # the other horizons' numbers (the simulation's random stream depends only on the longest).
+    horizons: Tuple[int, ...] = (5, 10, 21, 63, 126, 252)
     rating_horizon: int = 126         # the rating is judged on this horizon
 
     # --- Monte Carlo ----------------------------------------------------------------

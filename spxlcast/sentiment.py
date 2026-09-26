@@ -131,6 +131,7 @@ class ScoredNews:
     score: float      # VADER compound in [-1, 1]
     weight: float     # recency x relevance
     feeds: List[str] = field(default_factory=list)
+    relevance: float = 0.0   # relevance alone (max over the feeds it appeared in), without recency
 
 
 @dataclass
@@ -144,6 +145,7 @@ class SentimentResult:
     top_positive: List[ScoredNews] = field(default_factory=list)
     top_negative: List[ScoredNews] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    scored: List[ScoredNews] = field(default_factory=list)   # every unique story used (for the archive)
 
 
 def make_analyzer():
@@ -266,7 +268,8 @@ def analyze_news(
         if not key:
             continue
         recency = 0.5 ** (age / cfg.news_half_life_days)
-        w = recency * relevance(it)
+        rel = relevance(it)
+        w = recency * rel
         use_summary = len(titles_by_summary.get(it.summary, ())) <= 1
         s = score_article(analyzer, it, cfg.summary_weight, use_summary)
         tick = canon.get(it.ticker, it.ticker)
@@ -274,11 +277,12 @@ def analyze_news(
         if key in unique:
             best = unique[key]
             best.weight = max(best.weight, w)          # relevance = max over the feeds it appeared in
+            best.relevance = max(best.relevance, rel)
             best.feeds.append(it.ticker)
             if it.published > best.item.published:     # keep the freshest copy's text and score
                 best.item, best.score = it, s
         else:
-            unique[key] = ScoredNews(item=it, score=s, weight=w, feeds=[it.ticker])
+            unique[key] = ScoredNews(item=it, score=s, weight=w, feeds=[it.ticker], relevance=rel)
 
     scored = list(unique.values())
     if not scored:
@@ -303,4 +307,4 @@ def analyze_news(
                  f"({n_market} weighted as market-relevant), half-life {cfg.news_half_life_days:.0f} days")
     return SentimentResult(score=agg, label=sentiment_label(agg), n_articles=len(news), n_used=len(scored),
                            by_ticker=by_ticker, drift_adjustment=drift, top_positive=top_positive,
-                           top_negative=top_negative, notes=notes)
+                           top_negative=top_negative, notes=notes, scored=scored)

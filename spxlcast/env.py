@@ -6,7 +6,9 @@ puts them into ``os.environ`` without overriding variables that are already set.
 """
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -46,3 +48,26 @@ def fred_api_key() -> Optional[str]:
     load_dotenv()
     key = os.environ.get("FRED_API_KEY", "").strip()
     return key or None
+
+
+@functools.lru_cache(maxsize=1)
+def build_id() -> str:
+    """The code behind this run, logged with every forecast: ``SPXLCAST_BUILD`` (the git commit the
+    container image was built from), else the checkout's commit (``-dirty`` with uncommitted
+    changes), else ``unknown``. Shortened to 12 characters."""
+    env = os.environ.get("SPXLCAST_BUILD", "").strip()
+    if env and env != "unknown":
+        return env[:12]
+    here = Path(__file__).resolve().parent
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=here, capture_output=True, text=True, timeout=5)
+
+    try:
+        head = git("rev-parse", "--short=12", "HEAD")
+        if head.returncode == 0 and head.stdout.strip():
+            dirty = git("diff", "--quiet", "HEAD", "--").returncode == 1
+            return head.stdout.strip() + ("-dirty" if dirty else "")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"

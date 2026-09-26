@@ -172,4 +172,18 @@ def test_ordinal_and_horizon_label():
     assert [ordinal(x) for x in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 63, 100, 101)] == \
         ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd", "63rd", "100th", "101st"]
     assert horizon_label(21) == "1M" and horizon_label(126) == "6M" and horizon_label(252) == "1Y"
-    assert horizon_label(10) == "10d" and horizon_label(300) == "300d" and horizon_label(504) == "2Y"
+    assert horizon_label(10) == "2W" and horizon_label(300) == "300d" and horizon_label(504) == "2Y"
+
+
+def test_build_id_prefers_the_image_build_and_falls_back_to_git(monkeypatch):
+    from spxlcast.env import build_id
+    build_id.cache_clear()
+    try:
+        monkeypatch.setenv("SPXLCAST_BUILD", "f00dfeedbeefcafe1234")
+        assert build_id() == "f00dfeedbeef"
+        build_id.cache_clear()
+        monkeypatch.setenv("SPXLCAST_BUILD", "unknown")        # an image built without the argument
+        b = build_id()
+        assert b == "unknown" or len(b.split("-")[0]) == 12    # this checkout's commit when git is available
+    finally:
+        build_id.cache_clear()

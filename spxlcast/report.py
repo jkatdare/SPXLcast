@@ -35,6 +35,8 @@ def horizon_label(days: int) -> str:
     if days % 21 == 0:
         m = days // 21
         return f"{m}M" if m % 12 else f"{m // 12}Y"
+    if days < 21 and days % 5 == 0:
+        return f"{days // 5}W"
     return f"{days}d"
 
 
@@ -309,6 +311,10 @@ def render_score(rep, console: Console, path: str) -> None:
     if rep.first_date:
         head.append(f"  {rep.first_date} to {rep.last_date}")
     head.append(f"   |   {rep.n_scoreable} scoreable so far   |   {path}")
+    if rep.model_version:
+        head.append(f"   |   model {rep.model_version} only")
+    elif rep.versions:
+        head.append("   |   model " + ", ".join(f"{v} ({n} rows)" for v, n in rep.versions.items()))
     console.print(Panel(head, title="Track record", box=box.ROUNDED))
     for n in rep.notes:
         console.print(f"[yellow]note:[/yellow] {n}")

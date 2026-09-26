@@ -20,7 +20,7 @@ def test_annualize():
 def test_horizon_phrase():
     assert horizon_phrase(126) == "6-month"
     assert horizon_phrase(252) == "1-year"
-    assert horizon_phrase(10) == "10-day"
+    assert horizon_phrase(10) == "2-week"
 
 
 def test_strong_drift_low_vol_is_buy():

@@ -50,10 +50,11 @@ python -m spxlcast forecast --price 200 --json output/forecast.json --plot outpu
 python -m spxlcast --quiet --price 200
 ```
 
-Useful options (all subcommands): `--horizons 21 63 126 252`, `--rating-horizon 126`,
+Useful options (all subcommands): `--horizons 5 10 21 63 126 252`, `--rating-horizon 126`,
 `--paths 50000`, `--seed 42`, `--no-news`, `--no-fred`, `--no-macro-adj`, `--refresh` (bypass and
 rebuild the cache), and overrides `--index-drift 0.08`, `--vol 0.18`, `--pe 22`, `--div-yield 0.013`,
-`--eps-growth 0.055`, `--swap-spread 0.0075`, `--skew 1.0`.
+`--eps-growth 0.055`, `--swap-spread 0.0075`, `--skew 1.0`, and `--archive DIR` (store the run's
+inputs, simulator arguments and scored headlines; see `spxlcast/archive.py`).
 
 ## How to read the output
 
@@ -138,8 +139,16 @@ python -m spxlcast score          # PIT, band coverage, drawdown-touch hit rates
 ```
 
 Any subcommand accepts `--log-file PATH` to append its run as well. The scorer keeps one row per
-spot date (a close beats an intraday quote) and needs the shortest horizon (21 sessions) to elapse
-before it has anything to report.
+spot date (a close beats an intraday quote) and needs the shortest horizon to elapse before it has
+anything to report. The 1-week and 2-week horizons exist for fast feedback: daily forecasts
+overlap, so a year of logging holds about 50 independent 1-week outcomes but only 12 1-month ones,
+and the news tilt only acts over the first 10 days.
+
+Each row also records `model_version` (`MODEL_VERSION` in `config.py`, bumped whenever a change
+alters the numbers a run produces), `build` (the git commit of the code), `data_flags` (input
+problems such as `fred:none` or `vix6m:missing`; empty when clean), `fred_series` and
+`news_fetched`. `score --model-version X` scores one version only; by default versions are pooled
+with a note when there is more than one.
 
 ## Hosting the daily run on Azure
 
@@ -166,6 +175,12 @@ web app (about $14 a month) are the fixed charges; the hourly job costs under $1
 removes everything. `python -m spxlcast serve --root DIR [--live]` runs the same status page
 (and, with `--live`, the minute loop) locally.
 To run the steps by hand instead of through the script, follow `infra/DEPLOY.md`.
+
+Each job run also archives its inputs, exact simulator arguments and newly seen headlines on the
+share (`archive/`, not served by the page), and a scheduled GitHub workflow
+(`.github/workflows/healthcheck.yml`) checks the site four times a weekday, opening an issue when a
+scheduled run never logged, a run did not finish, the live price goes stale or the page is down.
+See `infra/DEPLOY.md` sections 10 and Archive.
 
 ## Data notes
 

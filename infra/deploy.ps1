@@ -68,7 +68,9 @@ Run group create -n $ResourceGroup -l $Location -o none
 Write-Host "`n== 2. container registry and cloud image build (no local Docker needed) ==" -ForegroundColor Yellow
 Run provider register -n Microsoft.ContainerRegistry --wait -o none
 Run acr create -n $acr -g $ResourceGroup --sku Basic --admin-enabled true -o none
-Run acr build -r $acr -t $image . -o none
+$build = "unknown"   # the git commit, logged with every forecast
+try { $sha = git rev-parse HEAD; if ($LASTEXITCODE -eq 0 -and $sha) { $build = "$sha".Trim() } } catch { }
+Run acr build -r $acr -t $image --build-arg "SPXLCAST_BUILD=$build" . -o none
 $acrServer = Query "$acr.azurecr.io" acr show -n $acr --query loginServer -o tsv
 $acrUser   = Query $acr acr credential show -n $acr --query username -o tsv
 $acrPass   = Query "<acr-password>" acr credential show -n $acr --query "passwords[0].value" -o tsv

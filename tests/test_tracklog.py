@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from spxlcast.config import Config
+from spxlcast.config import MODEL_VERSION, Config
 from spxlcast.montecarlo import simulate
 from spxlcast.tracklog import LOG_QUANTILES, _pit, append_log, forecast_row, load_log, score_log
 
 
-def _fake_forecast(spot=200.0, spot_date="2026-06-01", status="close", sentiment=0.1):
+def _fake_forecast(spot=200.0, spot_date="2026-06-01", status="close", sentiment=0.1, flags=()):
     T = 126
     sim = simulate(spot=spot, mu_annual=np.full(T, 0.07), sigma_annual=np.full(T, 0.16), leverage=3.0,
                    daily_cost=0.10 / 252, tracking_sd_daily=0.0, rf_annual=0.04, horizons=[21, 63, 126],
@@ -22,6 +22,7 @@ def _fake_forecast(spot=200.0, spot_date="2026-06-01", status="close", sentiment
         expected=SimpleNamespace(final=0.061), macro=SimpleNamespace(rf_3m=0.04, vix=17.0),
         etf=SimpleNamespace(annual_cost=0.104), sentiment=SimpleNamespace(score=sentiment, n_used=50),
         sim=sim, vol=SimpleNamespace(total_vol=lambda h: 0.16),
+        data_quality=lambda: {"flags": list(flags), "fred_series": 9, "news_fetched": 120},
     )
 
 
@@ -74,3 +75,37 @@ def test_score_log_with_nothing_elapsed(tmp_path):
     rep = score_log(path, closes=closes, cfg=Config())
     assert rep.n_rows == 1 and rep.n_scoreable == 0 and rep.horizons == []
     assert any("nothing to score" in n for n in rep.notes)
+
+
+def test_rows_carry_version_build_and_data_flags(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPXLCAST_BUILD", "0123456789abcdef0123")
+    from spxlcast.env import build_id
+    build_id.cache_clear()
+    try:
+        row = forecast_row(_fake_forecast(flags=("fred:none", "vix6m:missing")))
+        assert row["model_version"] == MODEL_VERSION and row["build"] == "0123456789ab"
+        assert row["data_flags"] == "fred:none;vix6m:missing" and row["fred_series"] == 9 and row["news_fetched"] == 120
+        path = str(tmp_path / "log.csv")
+        append_log(_fake_forecast(), path)
+        df = load_log(path)
+        assert df["build"].iloc[0] == "0123456789ab"            # read back as text, not a number
+    finally:
+        build_id.cache_clear()
+
+
+def test_score_log_splits_by_model_version(tmp_path):
+    path = str(tmp_path / "log.csv")
+    dates = pd.bdate_range("2026-01-02", periods=200)
+    closes = pd.Series(np.full(len(dates), 200.0), index=dates)
+    for i in range(0, 30, 5):
+        append_log(_fake_forecast(spot_date=str(dates[i].date())), path)
+    df = pd.read_csv(path, dtype=str)
+    df.loc[df.index[:2], "model_version"] = "0.1.0"          # two rows from an older model
+    df.to_csv(path, index=False)
+    pooled = score_log(path, closes=closes, cfg=Config())
+    assert pooled.versions == {"0.1.0": 2, MODEL_VERSION: 4} and pooled.n_scoreable == 6
+    assert any("pooled" in n for n in pooled.notes)
+    only = score_log(path, closes=closes, cfg=Config(), model_version=MODEL_VERSION)
+    assert only.n_rows == 4 and only.n_scoreable == 4 and only.model_version == MODEL_VERSION
+    missing = score_log(path, closes=closes, cfg=Config(), model_version="9.9.9")
+    assert missing.n_scoreable == 0 and any("no rows from model version 9.9.9" in n for n in missing.notes)

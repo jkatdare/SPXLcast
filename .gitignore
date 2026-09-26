@@ -9,3 +9,4 @@ output/
 *.env
 logs/*.tmp
 logs/spot_log.csv
+archive/

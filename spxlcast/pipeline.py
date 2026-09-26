@@ -7,8 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .config import Config
+from .config import FRED_SERIES, MODEL_VERSION, Config
 from .data import MarketSnapshot, load_market
+from .env import build_id
 from .etf import ETFParams, build_etf_params
 from .fundamentals import (ExpectedReturn, IndexFundamentals, MacroState, Sensitivity, VolTermStructure,
                            build_fundamentals, build_macro, expected_index_return, expected_inflation,
@@ -36,6 +37,37 @@ class Forecast:
     rating: Rating
     sensitivities: List[Sensitivity] = field(default_factory=list)
     mu_path: Optional[np.ndarray] = None
+    # The exact arguments passed to montecarlo.simulate, so an archived run can be replayed.
+    sim_inputs: Optional[Dict[str, Any]] = None
+    rating_sim_inputs: Optional[Dict[str, Any]] = None   # the untilted run behind the rating, when separate
+
+    def data_quality(self) -> Dict[str, Any]:
+        """Problems with this run's inputs (``flags`` empty = clean), logged with the track record."""
+        flags: List[str] = []
+        n_fred = len(self.snap.fred)
+        if self.cfg.use_fred:
+            if n_fred == 0:
+                flags.append("fred:none")
+            elif n_fred < len(FRED_SERIES):
+                flags.append("fred:partial")
+        for name, value in (("vix", self.macro.vix), ("vix3m", self.macro.vix3m), ("vix6m", self.macro.vix6m)):
+            if value is None:
+                flags.append(f"{name}:missing")
+        src = self.fundamentals.sources
+        if "default" in src.get("earnings_yield", ""):
+            flags.append("earnings:default")
+        elif "funds_data" in src.get("trailing_pe", ""):
+            flags.append("pe:funds_data")
+        if "default" in src.get("dividend_yield", ""):
+            flags.append("dividend:default")
+        if any(n.startswith("No price history for") for n in self.snap.notes):
+            flags.append("prices:partial")
+        news_fetched = None
+        if self.cfg.use_news:
+            news_fetched = self.sentiment.n_articles if self.sentiment else 0
+            if self.sentiment is None or self.sentiment.n_used == 0:
+                flags.append("news:none")
+        return {"flags": flags, "fred_series": n_fred, "news_fetched": news_fetched}
 
     # ---- helpers used by the report and JSON export ------------------------------------
     def price_lookup(self, price: float) -> List[Dict[str, float]]:
@@ -95,8 +127,8 @@ def run_forecast(cfg: Config) -> Forecast:
         n = min(cfg.sentiment_days, T)
         mu[:n] += sentiment.drift_adjustment
 
-    def _simulate(mu_path: np.ndarray) -> SimulationResult:
-        return simulate(
+    def _sim_inputs(mu_path: np.ndarray) -> Dict[str, Any]:
+        return dict(
             spot=spot, mu_annual=mu_path, sigma_annual=vol.daily, leverage=etf.leverage,
             daily_cost=etf.daily_cost, tracking_sd_daily=etf.tracking_sd_daily, rf_annual=macro.rf_3m,
             horizons=horizons, n_paths=cfg.n_paths, dof=cfg.t_dof, skew_gamma=cfg.skew_gamma,
@@ -104,12 +136,14 @@ def run_forecast(cfg: Config) -> Forecast:
             sv_persistence=cfg.sv_persistence, sv_logvol_sd=cfg.sv_logvol_sd, sv_leverage=cfg.sv_leverage,
         )
 
-    sim = _simulate(mu)
+    sim_inputs = _sim_inputs(mu)
+    sim = simulate(**sim_inputs)
     # The rating is judged on the distribution WITHOUT the news tilt: the tilt is not calibrated and
     # must not be able to flip a label. The displayed tables keep it (it only moves the first days).
-    sim_for_rating = sim
+    sim_for_rating, rating_sim_inputs = sim, None
     if sentiment is not None and sentiment.drift_adjustment != 0.0:
-        sim_for_rating = _simulate(np.full(T, expected.final))
+        rating_sim_inputs = _sim_inputs(np.full(T, expected.final))
+        sim_for_rating = simulate(**rating_sim_inputs)
 
     sigma_h = vol.total_vol(cfg.rating_horizon)
     sigma_1y = vol.total_vol(min(252, T))
@@ -136,7 +170,8 @@ def run_forecast(cfg: Config) -> Forecast:
     sens = influencer_sensitivities(snap, cfg)
     return Forecast(cfg=cfg, snap=snap, spot=spot, spot_date=spot_date, spot_status=spot_status, macro=macro,
                     fundamentals=fund, expected=expected, vol=vol, etf=etf, sentiment=sentiment, sim=sim,
-                    rating=rating, sensitivities=sens, mu_path=mu)
+                    rating=rating, sensitivities=sens, mu_path=mu, sim_inputs=sim_inputs,
+                    rating_sim_inputs=rating_sim_inputs)
 
 
 # ---------------------------------------------------------------------------------------
@@ -158,6 +193,9 @@ def forecast_to_dict(fc: Forecast, prices: Optional[List[float]] = None) -> Dict
     sim = fc.sim
     out: Dict[str, Any] = {
         "run_at": fc.snap.asof.isoformat(),
+        "model_version": MODEL_VERSION,
+        "build": build_id(),
+        "data_quality": fc.data_quality(),
         "prices_fetched_at": fc.snap.fetched_at.get("prices", fc.snap.asof).isoformat(),
         "etf": fc.cfg.etf,
         "spot": fc.spot,

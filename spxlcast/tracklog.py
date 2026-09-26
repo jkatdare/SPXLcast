@@ -7,6 +7,10 @@ spot date and reports, per horizon, where realised outcomes fell in the predicte
 (PIT), how often the 5-95% and 25-75% bands covered them, and whether the predicted chances of
 touching -20% / +20% matched reality. It also measures whether the news score had any relation to
 the next two weeks of returns, which is the calibration the sentiment channel currently lacks.
+
+Each row also records the model version, the build (git commit) and any data problems of that run
+(``data_flags``, empty when clean), so results can be scored per model version and runs on bad
+data can be told apart.
 """
 from __future__ import annotations
 
@@ -19,8 +23,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from . import __version__
-from .config import Config
+from .config import MODEL_VERSION, Config
+from .env import build_id
 
 LOG_QUANTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 DEFAULT_LOG = os.path.join("logs", "forecast_log.csv")
@@ -33,11 +37,16 @@ def _h(h: int, name: str) -> str:
 def forecast_row(fc) -> Dict[str, object]:
     """Flatten a Forecast into one CSV row."""
     sim = fc.sim
+    dq = fc.data_quality()
     row: Dict[str, object] = {
         "run_at": fc.snap.asof.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "spot_date": fc.spot_date,
         "spot_status": fc.spot_status,
-        "model_version": __version__,
+        "model_version": MODEL_VERSION,
+        "build": build_id(),
+        "data_flags": ";".join(dq["flags"]),
+        "fred_series": dq["fred_series"],
+        "news_fetched": "" if dq["news_fetched"] is None else dq["news_fetched"],
         "spot": round(fc.spot, 4),
         "rating": fc.rating.label,
         "score": round(fc.rating.score, 4),
@@ -96,7 +105,8 @@ def _rewrite_with_columns(path: str, fieldnames: List[str]) -> None:
 def load_log(path: str = DEFAULT_LOG) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
-    df = pd.read_csv(path)
+    # text columns that pandas would otherwise mangle ("1.10" -> 1.1, a hex commit -> a float)
+    df = pd.read_csv(path, dtype={"model_version": str, "build": str, "data_flags": str})
     if df.empty:
         return df
     df["run_at"] = pd.to_datetime(df["run_at"], utc=True)
@@ -136,6 +146,8 @@ class ScoreReport:
     sentiment_corr: Optional[float] = None
     sentiment_n: int = 0
     notes: List[str] = field(default_factory=list)
+    versions: Dict[str, int] = field(default_factory=dict)   # rows per model version in the whole log
+    model_version: Optional[str] = None                      # the version scored, when filtered
 
 
 def _pit(realised: float, quantiles: Dict[int, float]) -> float:
@@ -150,13 +162,29 @@ def _pit(realised: float, quantiles: Dict[int, float]) -> float:
     return float(np.interp(x, qv, lv) / 100.0)
 
 
-def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: Optional[Config] = None) -> ScoreReport:
+def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: Optional[Config] = None,
+              model_version: Optional[str] = None) -> ScoreReport:
+    """Score the logged forecasts; ``model_version`` restricts it to rows from that version."""
     cfg = cfg or Config()
     df = load_log(path)
-    report = ScoreReport(n_rows=int(len(df)), n_scoreable=0, first_date=None, last_date=None)
+    report = ScoreReport(n_rows=int(len(df)), n_scoreable=0, first_date=None, last_date=None,
+                         model_version=model_version)
     if df.empty:
         report.notes.append(f"no rows in {path}")
         return report
+    if "model_version" in df:
+        versions = df["model_version"].fillna("unknown").astype(str)
+        report.versions = {str(k): int(v) for k, v in versions.value_counts().sort_index().items()}
+        if model_version is not None:
+            df = df[versions == model_version].reset_index(drop=True)
+            report.n_rows = int(len(df))
+            if df.empty:
+                report.notes.append(f"no rows from model version {model_version} "
+                                    f"(the log has {', '.join(report.versions)})")
+                return report
+        elif len(report.versions) > 1:
+            report.notes.append(f"rows from {len(report.versions)} model versions are pooled "
+                                f"({', '.join(report.versions)}); use --model-version to score one")
     report.first_date = str(df["spot_date"].min().date())
     report.last_date = str(df["spot_date"].max().date())
     if closes is None:
