@@ -13,7 +13,8 @@ python -m spxlcast forecast --price 200 --price 250 \
     --archive "$DATA/archive" \
     --json "$DATA/output/forecast.json" \
     --plot "$DATA/output/fan.png" > "$DATA/output/report.txt" 2>&1 || { cat "$DATA/output/report.txt"; exit 1; }
-python -m spxlcast score --log-file "$DATA/logs/forecast_log.csv" > "$DATA/output/score.txt" 2>&1 || true
+python -m spxlcast score --log-file "$DATA/logs/forecast_log.csv" --archive "$DATA/archive" \
+    > "$DATA/output/score.txt" 2>&1 || true
 tail -n 3 "$DATA/output/report.txt"
 head -n 4 "$DATA/output/score.txt"
 echo "[$(date -u +%FT%TZ)] done"

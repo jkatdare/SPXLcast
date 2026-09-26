@@ -26,14 +26,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from spxlcast.config import Config   # noqa: E402
 
+# Shiller's data moved to shillerdata.com (the Yale copy stopped updating in 2023). The download
+# link carries a version stamp, so it is read from the page; the Yale URL is the last resort.
+PAGE = "https://shillerdata.com/"
 URL = "http://www.econ.yale.edu/~shiller/data/ie_data.xls"
+
+
+def shiller_url() -> str:
+    import re
+    import requests
+    try:
+        html = requests.get(PAGE, timeout=30, headers={"User-Agent": "Mozilla/5.0"}).text
+        m = re.search(r"(?:https?:)?//[^\"'\s]+/ie_data\.xls[^\"'\s]*", html)
+        if m:
+            return m.group(0) if m.group(0).startswith("http") else "https:" + m.group(0)
+    except requests.RequestException:
+        pass
+    return URL
 
 
 def load_shiller(path: Path) -> pd.DataFrame:
     if not path.exists():
         import requests
         path.parent.mkdir(parents=True, exist_ok=True)
-        r = requests.get(URL, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(shiller_url(), timeout=60, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         path.write_bytes(r.content)
     raw = pd.read_excel(path, sheet_name="Data", header=None, skiprows=8)

@@ -11,20 +11,32 @@ the next two weeks of returns, which is the calibration the sentiment channel cu
 Each row also records the model version, the build (git commit) and any data problems of that run
 (``data_flags``, empty when clean), so results can be scored per model version and runs on bad
 data can be told apart.
+
+Scores are reported honestly for overlapping windows: forecasts a day apart share most of their
+outcome window, so each horizon reports the number of independent outcomes the rows amount to and
+90% intervals from a block bootstrap (only once there are at least three). The whole distribution
+is also graded with CRPS against a naive benchmark (a lognormal at the raw VIX with a T-bill drift,
+see ``evaluation.naive_leveraged_lognormal``). With the run archive (``archive_dir``) the fine
+103-point percentile grid of each run is used instead of the nine logged quantiles.
 """
 from __future__ import annotations
 
 import csv
+import gzip
+import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from .config import MODEL_VERSION, Config
 from .env import build_id
+from .evaluation import (block_bootstrap, crps_quantiles, effective_n, naive_leveraged_lognormal,
+                         normal_quantiles, pit_from_quantiles)
 
 LOG_QUANTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
 DEFAULT_LOG = os.path.join("logs", "forecast_log.csv")
@@ -133,6 +145,14 @@ class HorizonScore:
     real_dd20: float
     pred_up20: float
     real_up20: float
+    n_eff: float = float("nan")                  # independent outcomes the overlapping rows amount to
+    mean_pit_ci: Tuple[float, float] = (float("nan"), float("nan"))     # 90% block-bootstrap intervals
+    cov_5_95_ci: Tuple[float, float] = (float("nan"), float("nan"))
+    crps_model: float = float("nan")             # mean CRPS of the log return (lower = better)
+    crps_naive: float = float("nan")
+    crps_skill: float = float("nan")             # 1 - model / naive: positive = better than the benchmark
+    crps_skill_ci: Tuple[float, float] = (float("nan"), float("nan"))
+    n_fine: int = 0                              # rows scored on the archived 103-point grid
 
 
 @dataclass
@@ -152,19 +172,32 @@ class ScoreReport:
 
 def _pit(realised: float, quantiles: Dict[int, float]) -> float:
     """Piecewise-linear CDF (in log price) through the stored quantiles."""
-    lv = np.array(sorted(quantiles))
-    qv = np.log(np.array([quantiles[int(k)] for k in lv]))
-    x = np.log(realised)
-    if x <= qv[0]:
-        return lv[0] / 200.0
-    if x >= qv[-1]:
-        return 1.0 - (100 - lv[-1]) / 200.0
-    return float(np.interp(x, qv, lv) / 100.0)
+    lv = sorted(quantiles)
+    return pit_from_quantiles(lv, np.log([quantiles[int(k)] for k in lv]), float(np.log(realised)))
+
+
+def _archived_grids(archive_dir: str, run_at) -> Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]]:
+    """Horizon -> (percent levels, prices) of the run's fine terminal-price grid, from the archive."""
+    t = pd.Timestamp(run_at)
+    t = t.tz_convert("UTC") if t.tzinfo is not None else t
+    path = os.path.join(archive_dir, "runs", t.strftime("%Y-%m-%d"), t.strftime("%H%M%SZ") + ".json.gz")
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    grids = {}
+    for h, f in ((rec.get("forecast") or {}).get("forecast") or {}).items():
+        g = f.get("grid")
+        if g and g.get("terminal"):
+            grids[int(h)] = (np.asarray(g["percentiles"], dtype=float), np.asarray(g["terminal"], dtype=float))
+    return grids
 
 
 def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: Optional[Config] = None,
-              model_version: Optional[str] = None) -> ScoreReport:
-    """Score the logged forecasts; ``model_version`` restricts it to rows from that version."""
+              model_version: Optional[str] = None, archive_dir: Optional[str] = None) -> ScoreReport:
+    """Score the logged forecasts; ``model_version`` restricts it to rows from that version and
+    ``archive_dir`` (the run archive) supplies each run's fine percentile grid when present."""
     cfg = cfg or Config()
     df = load_log(path)
     report = ScoreReport(n_rows=int(len(df)), n_scoreable=0, first_date=None, last_date=None,
@@ -200,6 +233,8 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
 
     horizons = sorted({int(h) for hs in df["horizons"].astype(str) for h in hs.split()})
     scored_any = set()
+    grid_cache: Dict[str, Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]]] = {}
+    nan2 = (float("nan"), float("nan"))
     for h in horizons:
         recs = []
         for _, row in df.iterrows():
@@ -212,24 +247,56 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
             path_vals = closes.iloc[pos + 1: pos + h + 1].values
             realised = float(path_vals[-1])
             spot = float(row["spot"])
+            grid = None
+            if archive_dir:
+                key = str(row["run_at"])
+                if key not in grid_cache:
+                    grid_cache[key] = _archived_grids(archive_dir, row["run_at"])
+                grid = (grid_cache[key] or {}).get(h)
+            if grid is not None:
+                levels, prices = grid
+            else:
+                levels = np.asarray(LOG_QUANTILES, dtype=float)
+                prices = np.asarray([float(qcols[lvl]) for lvl in LOG_QUANTILES])
+            qv = np.log(prices / spot)                 # everything in log return from the spot
+            y = math.log(realised / spot)
+            q5, q25, q50, q75, q95 = np.interp([5, 25, 50, 75, 95], levels, qv)
+
+            crps_naive = float("nan")
+            inputs = [row.get("vix"), row.get("rf_3m"), row.get("annual_cost")]
+            if all(v is not None and np.isfinite(float(v)) for v in inputs):
+                m, s = naive_leveraged_lognormal(*(float(v) for v in inputs), h, cfg.leverage_target)
+                crps_naive = crps_quantiles(levels, normal_quantiles(m, s, levels), y)   # same grid: comparable
             recs.append({
-                "pit": _pit(realised, {int(k): float(v) for k, v in qcols.items()}),
-                "in_5_95": float(qcols[5]) <= realised <= float(qcols[95]),
-                "in_25_75": float(qcols[25]) <= realised <= float(qcols[75]),
-                "below_5": realised < float(qcols[5]),
-                "above_95": realised > float(qcols[95]),
+                "pos": pos,
+                "pit": pit_from_quantiles(levels, qv, y),
+                "in_5_95": q5 <= y <= q95,
+                "in_25_75": q25 <= y <= q75,
+                "below_5": y < q5,
+                "above_95": y > q95,
                 "ret": realised / spot - 1.0,
-                "pred_med": float(qcols[50]) / spot - 1.0,
+                "pred_med": math.exp(q50) - 1.0,
                 "pred_dd20": float(row.get(_h(h, "p_dd20"), np.nan)),
                 "real_dd20": float(path_vals.min() <= 0.8 * spot),
                 "pred_up20": float(row.get(_h(h, "p_up20"), np.nan)),
                 "real_up20": float(path_vals.max() >= 1.2 * spot),
                 "rating": row["rating"],
+                "crps_model": crps_quantiles(levels, qv, y),
+                "crps_naive": crps_naive,
+                "fine": grid is not None,
             })
             scored_any.add(row["spot_date"])
         if not recs:
             continue
-        g = pd.DataFrame(recs)
+        g = pd.DataFrame(recs).sort_values("pos").reset_index(drop=True)
+        n_eff = effective_n(g["pos"].values, h)
+        enough = n_eff >= 3                    # intervals from fewer independent outcomes mean nothing
+        # a bootstrap block spans one outcome window: h sessions, in rows at the log's own spacing
+        spacing = float(np.median(np.diff(g["pos"].values))) if len(g) > 1 else 1.0
+        block = max(1, math.ceil(h / max(spacing, 1.0)))
+        both = g.dropna(subset=["crps_naive"])
+        crps_m = float(both["crps_model"].mean()) if len(both) else float("nan")
+        crps_n = float(both["crps_naive"].mean()) if len(both) else float("nan")
         report.horizons.append(HorizonScore(
             horizon=h, n=len(g), mean_pit=float(g["pit"].mean()),
             cov_5_95=float(g["in_5_95"].mean()), cov_25_75=float(g["in_25_75"].mean()),
@@ -237,6 +304,15 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
             mean_realised_return=float(g["ret"].mean()), mean_predicted_median_return=float(g["pred_med"].mean()),
             pred_dd20=float(g["pred_dd20"].mean()), real_dd20=float(g["real_dd20"].mean()),
             pred_up20=float(g["pred_up20"].mean()), real_up20=float(g["real_up20"].mean()),
+            n_eff=n_eff,
+            mean_pit_ci=block_bootstrap(g["pit"].values, block) if enough else nan2,
+            cov_5_95_ci=block_bootstrap(g["in_5_95"].astype(float).values, block) if enough else nan2,
+            crps_model=crps_m, crps_naive=crps_n,
+            crps_skill=1.0 - crps_m / crps_n if crps_n > 0 else float("nan"),
+            crps_skill_ci=(block_bootstrap(both[["crps_model", "crps_naive"]].values, block,
+                                           lambda a: 1.0 - a[:, 0].mean() / a[:, 1].mean())
+                           if enough and len(both) else nan2),
+            n_fine=int(g["fine"].sum()),
         ))
         if h == cfg.rating_horizon:
             for label, gg in g.groupby("rating"):
@@ -257,7 +333,8 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
             pairs.append((float(s), float(closes.iloc[pos + 10] / closes.iloc[pos] - 1.0)))
         if len(pairs) >= 10:
             a = np.array(pairs)
-            report.sentiment_corr = float(np.corrcoef(a[:, 0], a[:, 1])[0, 1])
+            if a[:, 0].std() > 0 and a[:, 1].std() > 0:      # a constant score has no correlation
+                report.sentiment_corr = float(np.corrcoef(a[:, 0], a[:, 1])[0, 1])
         report.sentiment_n = len(pairs)
     if report.n_scoreable == 0:
         report.notes.append("nothing to score yet: the shortest horizon has not elapsed since the first logged date")

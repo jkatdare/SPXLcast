@@ -83,7 +83,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help=f"append this run's forecast to a track-record CSV (default for `log`/`score`: {DEFAULT_LOG})")
     p.add_argument("--json", dest="json_path", default=None, help="write the full result to a JSON file")
     p.add_argument("--archive", dest="archive_dir", default=None,
-                   help="archive this run (inputs, simulator arguments, forecast) and its new headlines under DIR")
+                   help="the run archive: forecasts store their inputs, simulator arguments and new headlines "
+                        "there; `score` reads each run's fine percentile grid from it")
     p.add_argument("--plot", dest="plot_path", default=None, help="write a fan chart PNG to this path")
     p.add_argument("--quiet", action="store_true", help="only print the rating line")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -178,7 +179,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         console = Console(width=max(console.width, 120))
 
     if args.command == "score":
-        rep = score_log(args.log_file or DEFAULT_LOG, cfg=cfg, model_version=args.model_version)
+        rep = score_log(args.log_file or DEFAULT_LOG, cfg=cfg, model_version=args.model_version,
+                        archive_dir=args.archive_dir)
         render_score(rep, console, args.log_file or DEFAULT_LOG)
         return 0
 

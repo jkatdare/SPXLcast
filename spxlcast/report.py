@@ -1,10 +1,12 @@
 """Console rendering of a Forecast with rich."""
 from __future__ import annotations
 
+import math
 from typing import Iterable, List, Optional
 
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -320,20 +322,41 @@ def render_score(rep, console: Console, path: str) -> None:
         console.print(f"[yellow]note:[/yellow] {n}")
     if not rep.horizons:
         return
-    t = Table(title="Realised outcomes vs the forecast distribution (targets: mean PIT 0.50, "
-                    "5-95 band 90%, 25-75 band 50%, tails 5% each)", box=box.SIMPLE_HEAVY)
-    for c in ("Horizon", "n", "Mean PIT", "In 5-95", "In 25-75", "Below 5", "Above 95",
-              "Real mean ret", "Pred median ret", "P(dd20) pred/real", "P(up20) pred/real"):
+
+    def ci(pair, fmt: str) -> str:
+        lo, hi = pair
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            return escape("[n/a]")                   # brackets would otherwise be read as rich markup
+        return escape(f"[{fmt.format(lo)}, {fmt.format(hi)}]")
+
+    t = Table(title="Calibration: where realised prices fell in the forecast distribution (targets: mean PIT 0.50, "
+                    "5-95 band 90%, 25-75 band 50%, tails 5% each) [90% interval]", box=box.SIMPLE_HEAVY)
+    for c in ("Horizon", "n", "Indep.", "Mean PIT", "In 5-95", "In 25-75", "Below 5 / above 95",
+              "P(dd20) pred/real", "P(up20) pred/real"):
         t.add_column(c, justify="right")
     for hs in rep.horizons:
-        t.add_row(horizon_label(hs.horizon), str(hs.n), f"{hs.mean_pit:.2f}", pct(hs.cov_5_95, 0, False),
-                  pct(hs.cov_25_75, 0, False), pct(hs.frac_below_5, 0, False), pct(hs.frac_above_95, 0, False),
-                  pct(hs.mean_realised_return), pct(hs.mean_predicted_median_return),
+        t.add_row(horizon_label(hs.horizon), str(hs.n), f"{hs.n_eff:.1f}",
+                  f"{hs.mean_pit:.2f} {ci(hs.mean_pit_ci, '{:.2f}')}",
+                  f"{pct(hs.cov_5_95, 0, False)} {ci(hs.cov_5_95_ci, '{:.0%}')}", pct(hs.cov_25_75, 0, False),
+                  f"{pct(hs.frac_below_5, 0, False)} / {pct(hs.frac_above_95, 0, False)}",
                   f"{hs.pred_dd20:.0%}/{hs.real_dd20:.0%}", f"{hs.pred_up20:.0%}/{hs.real_up20:.0%}")
+    console.print(t)
+    t = Table(title="Accuracy: CRPS of the log return (lower = better) against a naive lognormal at the raw VIX "
+                    "with a T-bill drift; skill above zero = the model beat it [90% interval]", box=box.SIMPLE_HEAVY)
+    for c in ("Horizon", "n", "Real mean ret", "Pred median ret", "CRPS model", "CRPS naive", "Skill", "Scored on"):
+        t.add_column(c, justify="right")
+    for hs in rep.horizons:
+        skill = "n/a" if not math.isfinite(hs.crps_skill) else f"{hs.crps_skill:+.1%} {ci(hs.crps_skill_ci, '{:+.1%}')}"
+        t.add_row(horizon_label(hs.horizon), str(hs.n), pct(hs.mean_realised_return),
+                  pct(hs.mean_predicted_median_return), f"{hs.crps_model:.4f}", f"{hs.crps_naive:.4f}", skill,
+                  f"{hs.n_fine} fine / {hs.n - hs.n_fine} coarse grid")
     console.print(t)
     console.print("[dim]PIT = where the realised price fell in the predicted distribution (0 = below everything, "
                   "1 = above everything). A mean far from 0.5 is bias; band coverage far from target is mis-sized "
-                  "dispersion. Overlapping windows make these estimates noisier than the counts suggest.[/dim]")
+                  "dispersion. Indep. = how many independent outcomes the rows amount to: forecasts a day apart share "
+                  "most of their window, so a year of daily 1-month forecasts holds about 12. Intervals appear once "
+                  "there are 3; until then the numbers are anecdotes, not evidence. Fine = the run's 103-point grid "
+                  "from the archive; coarse = the 9 logged quantiles.[/dim]")
     if rep.by_rating:
         t = Table(title="Realised return at the rating horizon, by rating given", box=box.SIMPLE)
         for c in ("Rating", "n", "Mean realised return", "P(positive)"):
@@ -344,7 +367,8 @@ def render_score(rep, console: Console, path: str) -> None:
                 t.add_row(label, str(r["n"]), pct(r["mean_return"]), pct(r["p_positive"], 0, False))
         console.print(t)
     if rep.sentiment_n:
-        corr = "n/a (fewer than 10 pairs)" if rep.sentiment_corr is None else f"{rep.sentiment_corr:+.2f}"
+        corr = ("n/a (fewer than 10 pairs or no variation)" if rep.sentiment_corr is None
+                or not math.isfinite(rep.sentiment_corr) else f"{rep.sentiment_corr:+.2f}")
         console.print(f"News score vs next-10-session SPXL return: correlation {corr} over {rep.sentiment_n} dates. "
                       f"[dim]A value near zero means the news tilt has no predictive content and can stay informational.[/dim]")
 

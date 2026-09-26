@@ -138,6 +138,13 @@ python -m spxlcast score          # PIT, band coverage, drawdown-touch hit rates
                                   # and whether the news score predicted the next two weeks
 ```
 
+The scorer is honest about overlap: forecasts a day apart share most of their outcome window, so
+each horizon reports how many independent outcomes the rows amount to (a year of daily 1-month
+forecasts holds about 12) and 90% intervals from a block bootstrap once there are at least three.
+It also grades the whole distribution with CRPS against a naive lognormal at the raw VIX with a
+T-bill drift, and with `--archive DIR` it scores each run on its archived 103-point percentile
+grid rather than the nine logged quantiles.
+
 Any subcommand accepts `--log-file PATH` to append its run as well. The scorer keeps one row per
 spot date (a close beats an intraday quote) and needs the shortest horizon to elapse before it has
 anything to report. The 1-week and 2-week horizons exist for fast feedback: daily forecasts
@@ -204,7 +211,8 @@ See `infra/DEPLOY.md` sections 10 and Archive.
 ```bash
 python -m pytest
 python scripts/backtest_calibration.py --drift 0.07     # the engine: bands and touch probabilities
-python scripts/backtest_drift.py                        # the drift model: 150 years of Shiller data
+python scripts/backtest_drift.py                        # the drift model: 145 years of Shiller data
+python scripts/backtest_rating.py                       # the full model and the rating, 1990-2026
 ```
 
 **Engine calibration.** The first script builds the model's inputs at every month-end since 2016
@@ -220,9 +228,36 @@ at 6 months) for SPY and SPXL alike, because the index returned about 15% a year
 against the 7% assumed; that is the sample, not the fund mechanics.
 
 **Drift model.** The second script rebuilds the expected-return model month by month from 1881
-with Shiller's data and compares it with the realised nominal total return over the next 1, 5 and
-10 years. The model's drift carries real information (correlation 0.23 / 0.48 / 0.62 with realised
-returns at 1 / 5 / 10 years) and beats a constant 7% on error at every horizon with a bias under
-1%. The valuation term added nothing to this and biased the post-1990 era low, which is why it is
-off by default. Over 2016-2023 the model would have said about 6% a year while the market delivered
-12-15%, which explains the upward bias in the engine backtest.
+with Shiller's data (now published at shillerdata.com; the script finds the current file there)
+and compares it with the realised nominal total return over the next 1, 5 and 10 years. Over
+1881-2026 the model's drift carries real information (correlation 0.23 / 0.47 / 0.61 with realised
+returns at 1 / 5 / 10 years) and beats a constant 7% on error at every horizon, with a bias of
+-1.6% at one year and under 0.3% at five and ten. The valuation term added nothing to this and
+biased the post-1990 era low, which is why it is off by default. Over 2016-2023 the model would
+have said about 6% a year while the market delivered 12-15%, which explains the upward bias in the
+engine backtest.
+
+**Full model and rating.** The third script runs the live model's own functions at every month-end
+from 1990 to 2026 (440 of them) on data available at the time: Shiller earnings and dividends
+lagged three months, the 10-year breakeven from 2003 (trailing CPI inflation before), FRED rates,
+credit spreads, CPI and unemployment as released, and the VIX curve (VIX3M/VIX6M imputed from the
+VIX before 2008). Outcomes are SPXL from 2009 and, before that, a synthetic 3x fund that tracks
+SPXL with 0.998 daily correlation and a 0.3%/yr gap where both exist. Intervals account for
+overlapping windows (the 434 six-month outcomes amount to about 73 independent ones). Findings:
+
+* The forecast distribution is well calibrated and beats a naive benchmark. The 90% band held
+  91-93% of outcomes from one week to six months, and the model's CRPS is 3% (1 week) to 15%
+  (6 months) better than a lognormal at the raw VIX with a T-bill drift, with 90% intervals above
+  zero at every horizon. The median is slightly low (mean PIT 0.54-0.57) and the chance of a 20%
+  dip is overstated by 4-6 points at 3-6 months.
+* The fundamentals drift adds nothing measurable at these horizons: against the same engine with
+  a constant 7% drift, 6-month skill is +0.4% (90% interval -0.6% to +1.5%). Valuation predicts
+  5-10 year returns (above), not the next six months.
+* The rating does not predict returns. Rank correlation of the score with the next 6 months'
+  SPXL excess return is -0.03 (-0.18 to +0.12); months rated BUY did no better than the rest
+  (-3.8%, -13.7% to +5.7%). The label mostly tracks financing cost and volatility: BUY in 81-86%
+  of months in the zero-rate years 2008-2021, HOLD in 95% since 2022. SELL fired in 12 months
+  (autumn 1998, late 2000, October 2008 to March 2009, March 2020), mostly at volatility spikes
+  near market bottoms, and SPXL averaged +38% over the following six months. No BUY/SELL threshold
+  worked in both halves of the sample, so the thresholds are left unchanged; treat the rating as
+  a summary of the risk-reward the model sees, not a timing signal.
