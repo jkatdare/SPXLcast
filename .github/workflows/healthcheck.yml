@@ -1,8 +1,10 @@
 # Checks the live site on a schedule and opens a GitHub issue when something is wrong: a scheduled
-# run that never logged a forecast, a run that did not finish its outputs, a stale live price during
-# the session, a stale price feed, or the page being down (see spxlcast/health.py). Further failures
-# comment on the same issue, and it is closed automatically once all checks pass again. A failed
-# check also fails this workflow, which triggers GitHub's failed-workflow email.
+# run that never logged a forecast, a run that did not finish its outputs, a failed score step, a
+# stopped live loop, a stale price feed, or the page being down (see spxlcast/health.py). Further
+# failures comment on the same issue; it is closed automatically by the next passing check, scheduled
+# or manual, made while the NYSE session is open: only such a check sees the live loop at work. A
+# failed check also fails this workflow, which triggers GitHub's failed-workflow email. Keep the cron
+# lines in sync with CHECKS in spxlcast/health.py (a test checks).
 name: Health check
 
 on:
@@ -48,7 +50,9 @@ jobs:
           fi
           exit 1
       - name: Close the health-check issue after recovery
-        if: steps.check.outcome == 'success'
+        # A pass outside the session (the evening check, a holiday, after an early close, a check
+        # delayed past the bell) does not show the live loop working: health.py says which it was.
+        if: steps.check.outcome == 'success' && steps.check.outputs.live_checked == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

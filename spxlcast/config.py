@@ -6,12 +6,14 @@ Rates, yields and returns are expressed as decimals (0.05 == 5%) unless stated o
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Optional, Tuple
+from datetime import date, time, timedelta
+from functools import lru_cache
+from typing import FrozenSet, Optional, Tuple
 
 # Version of the forecasting model, logged with every track-record row so results can be scored per
 # version. Bump it whenever a change alters the numbers a run produces (inputs, assumptions, the
 # simulation, the rating); pure plumbing, reporting or extra horizons do not need a bump.
-MODEL_VERSION = "0.2.0"
+MODEL_VERSION = "0.3.0"
 
 
 @dataclass
@@ -46,7 +48,7 @@ class Config:
     long_run_real_eps_growth: float = 0.03     # real per-share earnings growth; nominal = this + expected inflation
     expected_inflation_default: float = 0.025  # used when a market breakeven is unavailable
     # Optional countercyclical valuation term, 0.5 x (E/P - neutral) capped. Off by default: over
-    # 1881-2023 (scripts/backtest_drift.py) it added no predictive value to the blend and biased the
+    # 1881-2026 (scripts/backtest_drift.py) it added no predictive value to the blend and biased the
     # post-1990 era low, because the market re-rated to structurally higher valuations.
     neutral_earnings_yield: float = 0.05       # trailing E/P at which the valuation term is zero (P/E 20)
     valuation_sensitivity: float = 0.0         # drift adj per 1.00 of E/P deviation from neutral (0 = off)
@@ -79,6 +81,7 @@ class Config:
                                             # calibrated so that 3x SPY minus costs reproduces SPXL over 1-5 years
     calibration_lookback_days: int = 504    # ~2 years for the beta / tracking calibration
     calibration_outlier_mads: float = 5.0   # residuals beyond this many robust SDs are excluded from the fit
+    calibration_min_r2: float = 0.99        # below this the price history is suspect (clean 2021-2026 fits: >= 0.998)
 
     # --- News sentiment --------------------------------------------------------------
     use_news: bool = True
@@ -104,7 +107,7 @@ class Config:
     price_ttl_hours: float = 6.0           # after the close (the key also changes at the bell)
     price_ttl_hours_open: float = 0.5      # while the session is open, so hourly runs see a fresh quote
     info_ttl_hours: float = 12.0
-    news_ttl_hours: float = 1.0
+    news_ttl_hours: float = 0.5            # well under the hourly job period, so every run reads fresh headlines
     use_fred: bool = True
     fred_timeout: float = 8.0
     refresh: bool = False               # ignore the cache
@@ -155,3 +158,63 @@ FRED_SERIES = {
     "UNRATE": "Unemployment rate (%)",
     "CPIAUCSL": "CPI-U (index)",
 }
+
+
+# NYSE trading calendar (standard library only, so the health check can use it too). Holidays follow
+# NYSE Rule 7.2: a Saturday holiday is observed on Friday and a Sunday one on Monday, except that a
+# Saturday New Year's Day is not moved into the old year. Unscheduled closures are listed by hand.
+NYSE_SPECIAL_CLOSURES = (date(2012, 10, 29), date(2012, 10, 30), date(2018, 12, 5), date(2025, 1, 9))
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th ``weekday`` (Monday = 0) of the month; n = -1 is the last one."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter(year: int) -> date:
+    """Western Easter Sunday (anonymous Gregorian algorithm)."""
+    a, b, c = year % 19, year // 100, year % 100
+    h = (19 * a + b - b // 4 - (b - (b + 8) // 25 + 1) // 3 + 15) % 30
+    l = (32 + 2 * (b % 4) + 2 * (c // 4) - h - c % 4) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    return date(year, (h + l - 7 * m + 114) // 31, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def _observed(d: date) -> date:
+    return d - timedelta(days=1) if d.weekday() == 5 else d + timedelta(days=1) if d.weekday() == 6 else d
+
+
+@lru_cache(maxsize=None)
+def _nyse_days(year: int) -> Tuple[FrozenSet[date], FrozenSet[date]]:
+    """(full-day holidays, 13:00 early closes) of one year."""
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    holidays = {
+        _nth_weekday(year, 1, 0, 3),            # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),            # Washington's Birthday
+        _easter(year) - timedelta(days=2),      # Good Friday
+        _nth_weekday(year, 5, 0, -1),           # Memorial Day
+        _observed(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),            # Labor Day
+        thanksgiving,
+        _observed(date(year, 12, 25)),
+    }
+    if date(year, 1, 1).weekday() != 5:
+        holidays.add(_observed(date(year, 1, 1)))
+    if year >= 2022:
+        holidays.add(_observed(date(year, 6, 19)))   # Juneteenth
+    holidays.update(d for d in NYSE_SPECIAL_CLOSURES if d.year == year)
+    # 3 July and 24 December close early on Monday to Thursday; on a Friday they are the observed holiday.
+    early = {thanksgiving + timedelta(days=1)} | {d for d in (date(year, 7, 3), date(year, 12, 24)) if d.weekday() < 4}
+    return frozenset(holidays), frozenset(early - holidays)
+
+
+def nyse_session(day: date) -> Optional[Tuple[time, time]]:
+    """Regular-session (open, close) New York times on ``day``, or None when NYSE is closed all day."""
+    holidays, early = _nyse_days(day.year)
+    if day.weekday() >= 5 or day in holidays:
+        return None
+    return time(9, 30), time(13, 0) if day in early else time(16, 0)

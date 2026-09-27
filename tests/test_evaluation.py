@@ -3,8 +3,9 @@ import math
 import numpy as np
 import pytest
 
-from spxlcast.evaluation import (block_bootstrap, crps_normal, crps_quantiles, crps_sample, effective_n,
-                                 naive_leveraged_lognormal, normal_quantiles, pit_from_quantiles, skill, spearman)
+from spxlcast.evaluation import (crps_normal, crps_quantiles, crps_sample, effective_n, mean_interval,
+                                 naive_leveraged_lognormal, normal_quantiles, pit_from_quantiles, proportion_interval,
+                                 skill, skill_interval, spearman)
 from spxlcast.live import GRID_PERCENTILES
 from spxlcast.montecarlo import simulate
 
@@ -47,29 +48,82 @@ def test_effective_n_counts_non_overlapping_windows():
     assert effective_n(monthly, 5) == 12                                # no overlap: every forecast counts
     assert effective_n(monthly, 126) == pytest.approx((231 + 126) / 126)
     assert effective_n([], 21) == 0.0
+    # an outage adds no outcomes: 60 daily rows, a year's gap, 5 more rows
+    assert effective_n(np.r_[0:60, 312:317], 21) == pytest.approx((59 + 21 + 4 + 21) / 21)
+    assert effective_n(np.r_[0:12, 32:38], 5) == pytest.approx(5.2)
+    assert effective_n([3, 3, 3], 5) == pytest.approx(1.0)                # one session counts once
 
 
-def test_block_bootstrap_widens_for_correlated_data_and_needs_two_blocks():
-    rng = np.random.default_rng(2)
-    iid = rng.normal(0.0, 1.0, 400)
-    lo, hi = block_bootstrap(iid, 1)
-    assert lo < 0.0 < hi and (hi - lo) == pytest.approx(2 * 1.645 / math.sqrt(400), rel=0.25)
-    ar = np.zeros(400)
-    for i in range(1, 400):                    # strongly autocorrelated, like overlapping windows
-        ar[i] = 0.95 * ar[i - 1] + rng.normal()
-    naive_width = np.subtract(*block_bootstrap(ar, 1)[::-1])
-    block_width = np.subtract(*block_bootstrap(ar, 40)[::-1])
-    assert block_width > 2 * naive_width
-    assert all(math.isnan(v) for v in block_bootstrap(iid[:30], 21))  # fewer than two blocks: no interval
-    pair = np.column_stack([iid, iid + 1.0])
-    lo, hi = block_bootstrap(pair, 5, lambda a: (a[:, 1] - a[:, 0]).mean())
-    assert lo == pytest.approx(1.0) and hi == pytest.approx(1.0)
+def test_closed_form_intervals():
+    from scipy.stats import t
+    x = np.array([0.2, 0.4, 0.6, 0.8])
+    lo, hi = mean_interval(x, 4)
+    assert (lo + hi) / 2 == pytest.approx(0.5) and hi - lo == pytest.approx(2 * t.ppf(0.95, 3) * x.std(ddof=1) / 2)
+    lo4, hi4 = mean_interval(np.tile(x, 4), 4)             # more overlapping rows, same independent outcomes
+    assert hi4 - lo4 > 0.8 * (hi - lo)
+    assert all(math.isnan(v) for v in mean_interval(x, 1.9))
+    lo, hi = proportion_interval(1.0, 4)                    # every row in the band: still an interval
+    assert 0.4 < lo < 0.8 and hi == 1.0
+    lo, hi = proportion_interval(0.9, 50)
+    assert lo < 0.9 < hi and hi - lo < 0.2
+    assert all(math.isnan(v) for v in proportion_interval(float("nan"), 5))
+    m, b = np.array([1.0, 2.0, 3.0, 2.0]), np.array([2.0, 2.5, 3.5, 2.0])
+    lo, hi = skill_interval(m, b, 4)
+    assert lo < skill(m, b) < hi
+    assert all(math.isnan(v) for v in skill_interval(m, np.zeros(4), 4))
+
+
+def _crps_normal_v(sd, y):
+    from scipy.stats import norm
+    z = np.asarray(y) / sd
+    return sd * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / math.sqrt(math.pi))
+
+
+def test_intervals_cover_the_truth_for_overlapping_windows():
+    """Perfectly calibrated daily 1-month forecasts (true mean PIT 0.5, true 5-95 coverage 90%, a
+    known skill against a too-wide and against a shifted benchmark): the 90% intervals must cover
+    close to 90% of the time, also early on with few independent outcomes (the old block bootstrap
+    managed 43-54%, a delta-method skill interval 75% against the shifted benchmark), and must not
+    be far wider than needed."""
+    from scipy.stats import norm
+    rng = np.random.default_rng(11)
+    h, reps = 21, 400
+    big = rng.normal(0.0, 1.0, 1_000_000)
+    wide, shifted = (lambda y: _crps_normal_v(1.3, y)), (lambda y: _crps_normal_v(1.0, y - 0.3))
+    true_skill = [1.0 - _crps_normal_v(1.0, big).mean() / bench(big).mean() for bench in (wide, shifted)]
+    for rows in (63, 252):                                  # about 4 and 13 independent outcomes
+        hits = np.zeros(4)
+        for _ in range(reps):
+            walk = np.r_[0.0, np.cumsum(rng.normal(0.0, 1.0, rows + h))]
+            y = (walk[h:h + rows] - walk[:rows]) / math.sqrt(h)
+            ne = effective_n(np.arange(rows), h)
+            lo, hi = mean_interval(norm.cdf(y), ne)
+            hits[0] += lo <= 0.5 <= hi
+            lo, hi = proportion_interval(float(np.mean(np.abs(y) <= norm.ppf(0.95))), ne)
+            hits[1] += lo <= 0.9 <= hi
+            for j, bench in enumerate((wide, shifted)):
+                lo, hi = skill_interval(_crps_normal_v(1.0, y), bench(y), ne)
+                hits[2 + j] += lo <= true_skill[j] <= hi
+        cover = hits / reps
+        assert np.all(cover >= 0.82), (rows, cover)
+        assert cover[0] <= 0.96 and cover[1] <= 0.995 and np.all(cover[2:] <= 0.97), (rows, cover)
 
 
 def test_spearman():
     a = np.arange(10.0)
     assert spearman(a, a ** 3) == pytest.approx(1.0)
-    assert spearman(np.column_stack([a, -a])) == pytest.approx(-1.0)
+    assert spearman(a, -a) == pytest.approx(-1.0)
+
+
+def test_spearman_averages_tied_ranks_and_is_nan_for_a_constant():
+    from scipy.stats import spearmanr
+    rng = np.random.default_rng(5)
+    x = np.clip(rng.normal(0.5, 0.5, 200), -1.0, 1.0)       # clipped like the rating score: many ties at +/-1
+    y = x + rng.normal(0.0, 1.0, 200)
+    assert spearman(x, y) == pytest.approx(spearmanr(x, y).statistic)
+    p = rng.permutation(200)
+    assert spearman(x[p], y[p]) == pytest.approx(spearman(x, y))       # row order does not matter
+    assert math.isnan(spearman(np.ones(5), np.arange(5.0)))
 
 
 def test_naive_lognormal_matches_the_engine_with_normal_shocks():

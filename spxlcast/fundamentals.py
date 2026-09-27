@@ -14,11 +14,55 @@ import pandas as pd
 
 from .config import Config
 from .data import MarketSnapshot
+from .data import _finite as _num      # a Yahoo info value as a finite float, or None
 
 
 def _pct(v: Optional[float]) -> Optional[float]:
     """Yahoo/FRED quote yields in percent; convert to decimal."""
     return None if v is None or not np.isfinite(v) else float(v) / 100.0
+
+
+def _calendar_months(series: Optional[pd.Series]) -> Optional[pd.Series]:
+    """A monthly FRED series on a gap-free calendar of months, so positions are months, not rows.
+
+    A single missing month (BLS published no October 2025 CPI or unemployment) is filled with the
+    mean of its two neighbours; a longer hole stays NaN, so nothing is computed across it."""
+    if series is None:
+        return None
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return None
+    s.index = pd.DatetimeIndex(s.index).to_period("M")
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s.reindex(pd.period_range(s.index[0], s.index[-1], freq="M"))
+    hole = s.isna() & s.shift(1).notna() & s.shift(-1).notna()
+    return s.where(~hole, (s.shift(1) + s.shift(-1)) / 2.0)
+
+
+def cpi_yoy_from(series: Optional[pd.Series]) -> Optional[float]:
+    """Year-over-year change of a monthly index (CPIAUCSL) from its latest month to the same month a
+    year earlier, by date. None when that month is missing (beyond a one-month hole) or too early."""
+    s = _calendar_months(series)
+    if s is None or len(s) < 13:
+        return None
+    base = float(s.iloc[-13])
+    if not np.isfinite(base) or base <= 0:
+        return None
+    return float(s.iloc[-1] / base - 1.0)
+
+
+def sahm_gap_from(series: Optional[pd.Series]) -> Optional[float]:
+    """Sahm gap of a monthly unemployment rate (in its own units, pp for UNRATE): the latest 3-month
+    average minus the minimum of the 12 three-month averages before it, on calendar months. Windows
+    that touch a hole longer than one month are skipped; None without the latest window."""
+    s = _calendar_months(series)
+    if s is None or len(s) < 15:
+        return None
+    roll = s.rolling(3).mean()
+    prior = roll.iloc[-13:-1].dropna()
+    if not np.isfinite(roll.iloc[-1]) or prior.empty:
+        return None
+    return float(roll.iloc[-1] - prior.min())
 
 
 def discount_to_bey(d: float, days: int = 91) -> float:
@@ -76,6 +120,25 @@ class ExpectedReturn:
 
 
 # ---------------------------------------------------------------------------------------
+def _vol_nowcast(snap: MarketSnapshot, ticker: str, lookback: int = 252) -> Optional[float]:
+    """``ticker``'s last close, brought up to the VIX's newer session when it has no bar for it yet
+    (at 09:40 ET Yahoo has today's VIX but not today's VIX3M/VIX6M), so all vol pillars are of one
+    instant: scaled by the VIX's move since then to the power of the beta of its daily log changes
+    on the VIX's over the last ``lookback`` sessions."""
+    v = snap.fresh_last(ticker)
+    s, vix = snap.close(ticker), snap.close("^VIX")
+    if v is None or vix is None or snap.fresh_last("^VIX") is None or s.index[-1] >= vix.index[-1]:
+        return v
+    both = pd.concat({"vix": vix, "v": s}, axis=1, join="inner").iloc[-lookback - 1:]
+    if not len(both) or both.index[-1] != s.index[-1] or (both <= 0).any().any():
+        return v
+    r = np.log(both).diff().dropna()
+    if len(r) < 60 or not r.iloc[:, 0].var() > 0:
+        return v
+    beta = float(np.clip(r.cov().iloc[0, 1] / r.iloc[:, 0].var(), 0.0, 1.0))
+    return v * (float(vix.iloc[-1]) / float(both.iloc[-1, 0])) ** beta
+
+
 def build_macro(snap: MarketSnapshot, cfg: Config) -> MacroState:
     src: Dict[str, str] = {}
 
@@ -136,24 +199,26 @@ def build_macro(snap: MarketSnapshot, cfg: Config) -> MacroState:
     sahm_gap = None
     un = snap.fred.get("UNRATE")
     if un is not None and len(un.dropna()) >= 15:
-        un = un.dropna()
-        unemployment = float(un.iloc[-1]) / 100.0
-        roll = un.rolling(3).mean()
-        sahm_gap = float(roll.iloc[-1] - roll.iloc[-13:-1].min())   # Sahm: 3m avg vs min of prior 12 3m avgs
+        unemployment = float(un.dropna().iloc[-1]) / 100.0
+        sahm_gap = sahm_gap_from(un)
         src["unemployment"] = "FRED:UNRATE"
 
     cpi_yoy = None
     cpi = snap.fred.get("CPIAUCSL")
     if cpi is not None and len(cpi.dropna()) >= 13:
-        cpi = cpi.dropna()
-        cpi_yoy = float(cpi.iloc[-1] / cpi.iloc[-13] - 1.0)
-        src["cpi_yoy"] = "FRED:CPIAUCSL"
+        cpi_yoy = cpi_yoy_from(cpi)
+        src["cpi_yoy"] = ("FRED:CPIAUCSL" if cpi_yoy is not None
+                          else "FRED:CPIAUCSL has no month a year before the latest; YoY skipped")
+
+    vix3m, vix6m = _vol_nowcast(snap, "^VIX3M"), _vol_nowcast(snap, "^VIX6M")
+    if vix3m != snap.fresh_last("^VIX3M") or vix6m != snap.fresh_last("^VIX6M"):
+        src["vix_term"] = "Yahoo; 3M/6M moved with the VIX since their last close (no bar yet today)"
 
     return MacroState(
         rf_3m=rf_3m, y2=y2, y5=y5, y10=y10, y30=y30, curve_10y_3m=curve,
         breakeven_10y=breakeven, real_10y=real_10y, sofr=sofr, hy_oas=hy_oas,
         unemployment=unemployment, unemployment_sahm_gap=sahm_gap, cpi_yoy=cpi_yoy,
-        vix=snap.fresh_last("^VIX"), vix3m=snap.fresh_last("^VIX3M"), vix6m=snap.fresh_last("^VIX6M"),
+        vix=snap.fresh_last("^VIX"), vix3m=vix3m, vix6m=vix6m,
         vvix=snap.fresh_last("^VVIX"), skew=snap.fresh_last("^SKEW"),
         dxy=snap.fresh_last("DX-Y.NYB"), oil=snap.fresh_last("CL=F"), gold=snap.fresh_last("GC=F"),
         sources=src,
@@ -174,9 +239,9 @@ def build_fundamentals(snap: MarketSnapshot, cfg: Config, inflation: Optional[fl
     if trailing_pe is not None:
         src["trailing_pe"] = "override"
     else:
-        pe = info.get("trailingPE")
-        if pe and np.isfinite(pe) and pe > 0:
-            trailing_pe = float(pe)
+        pe = _num(info.get("trailingPE"))
+        if pe is not None and pe > 0:
+            trailing_pe = pe
             src["trailing_pe"] = f"Yahoo:{cfg.index_etf}.info.trailingPE"
         elif stats.get("earnings_to_price"):
             trailing_pe = 1.0 / stats["earnings_to_price"]
@@ -195,14 +260,14 @@ def build_fundamentals(snap: MarketSnapshot, cfg: Config, inflation: Optional[fl
     if dividend_yield is not None:
         src["dividend_yield"] = "override"
     else:
-        dy = info.get("yield")
-        if dy is not None and np.isfinite(dy) and 0 < dy < 0.2:
-            dividend_yield = float(dy)
+        dy = _num(info.get("yield"))
+        if dy is not None and 0 < dy < 0.2:
+            dividend_yield = dy
             src["dividend_yield"] = f"Yahoo:{cfg.index_etf}.info.yield"
         else:
-            dy = info.get("dividendYield")
-            if dy is not None and np.isfinite(dy) and dy > 0:
-                dividend_yield = float(dy) / 100.0 if dy > 0.2 else float(dy)
+            dy = _num(info.get("dividendYield"))
+            if dy is not None and dy > 0:
+                dividend_yield = dy / 100.0 if dy > 0.2 else dy
                 src["dividend_yield"] = f"Yahoo:{cfg.index_etf}.info.dividendYield"
             else:
                 dividend_yield = 0.013
@@ -295,6 +360,7 @@ class VolTermStructure:
     daily: np.ndarray               # shape (T,), annualised vol applying on day t
     pillars: Dict[int, float]       # horizon days -> implied vol (after the VRP haircut)
     notes: List[str] = field(default_factory=list)
+    one_year_vol: Optional[float] = None   # total vol to 252 days, also when ``daily`` stops before that
 
     def total_vol(self, horizon: int) -> float:
         """Annualised vol that reproduces the total variance to ``horizon`` days."""
@@ -317,7 +383,8 @@ def vol_term_structure(macro: MacroState, snap: MarketSnapshot, cfg: Config, hor
     notes: List[str] = []
     if cfg.override_vol is not None:
         daily = np.full(horizon, float(cfg.override_vol))
-        return VolTermStructure(daily, {horizon: float(cfg.override_vol)}, ["flat vol override"])
+        return VolTermStructure(daily, {horizon: float(cfg.override_vol)}, ["flat vol override"],
+                                float(cfg.override_vol))
 
     h1, h3, h6 = _haircuts(cfg)
     close = snap.close(cfg.index_etf)
@@ -353,7 +420,7 @@ def vol_term_structure(macro: MacroState, snap: MarketSnapshot, cfg: Config, hor
                  + ", ".join(f"{h}d {s:.1%}" for h, s in pillars.items()))
     if rv is not None:
         notes.append(f"realised 3m vol of {cfg.index_etf}: {rv:.1%} (diagnostic only)")
-    return VolTermStructure(daily[:horizon], pillars, notes)
+    return VolTermStructure(daily[:horizon], pillars, notes, float(np.sqrt(np.mean(daily[:252] ** 2))))
 
 
 # ---------------------------------------------------------------------------------------

@@ -25,7 +25,7 @@ env:
   ACR_NAME: spxlcastacr
   JOB_NAME: spxlcast-daily
   WEB_NAME: spxlcast-web
-  CRON: "40 13-21 * * 1-5"   # UTC: hourly through the US session plus one run after the close
+  CRON: "40 13-21 * * 1-5"   # UTC: hourly through the US session plus one run after the close; = SCHEDULE in spxlcast/health.py
 
 jobs:
   test:

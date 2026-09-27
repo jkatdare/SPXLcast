@@ -13,6 +13,7 @@ from rich.text import Text
 
 from .config import MARKET_TICKERS
 from .pipeline import Forecast
+from .tracklog import MIN_INDEPENDENT
 
 RATING_STYLE = {"BUY": "bold green", "HOLD": "bold yellow", "SELL": "bold red"}
 
@@ -144,7 +145,7 @@ def render_drivers(fc: Forecast, console: Console) -> None:
     for k, val in e.adjustments.items():
         t.add_row(f"  adj: {k}", pct(val), "countercyclical valuation term" if k == "valuation" else "risk-regime penalty")
     for n in e.notes:
-        t.add_row("", "", f"[dim]{n}[/dim]")
+        t.add_row("", "", f"[dim]{escape(n)}[/dim]")
     detail = ("command-line override (not clipped)" if fc.cfg.override_index_drift is not None
               else f"clipped to [{fc.cfg.drift_floor:+.0%}, {fc.cfg.drift_cap:+.0%}]")
     t.add_row("[bold]Final index drift[/bold]", f"[bold]{pct(e.final)}[/bold]", detail)
@@ -170,7 +171,7 @@ def render_drivers(fc: Forecast, console: Console) -> None:
               f"({etf.leverage - 1:.0f}x) x (3m bill + {fc.cfg.swap_spread:.2%} all-in spread)")
     t.add_row("Volatility decay", pct(etf.theoretical_drag(sig), 1, False),
               "L(L-1)/2 x sigma^2 at the horizon vol (emerges in the simulation)")
-    sig_1y = v.total_vol(min(252, len(v.daily)))
+    sig_1y = v.one_year_vol if v.one_year_vol is not None else v.total_vol(min(252, len(v.daily)))
     t.add_row("Break-even index return", pct(etf.breakeven_index_return(sig_1y), 1, False),
               "arithmetic index return at which SPXL's median is flat over a year (at the 1-year vol)")
     if etf.calibration:
@@ -178,7 +179,7 @@ def render_drivers(fc: Forecast, console: Console) -> None:
         t.add_row("Realised beta / R2", f"{c.beta:.2f} / {c.r2:.3f}",
                   f"{c.n} days, {c.n_outliers} dislocation days excluded; tracking noise {c.resid_sd_daily:.2%}/day")
     for n in v.notes + etf.notes:
-        t.add_row("", "", f"[dim]{n}[/dim]")
+        t.add_row("", "", f"[dim]{escape(n)}[/dim]")
     console.print(t)
 
 
@@ -234,11 +235,11 @@ def render_metrics(fc: Forecast, console: Console) -> None:
         ("HY credit spread (OAS)", pct(m.hy_oas, 2, False), src.get("hy_oas", "FRED unavailable")),
         ("CPI YoY", pct(m.cpi_yoy, 2, False), src.get("cpi_yoy", "FRED unavailable")),
         ("Unemployment", pct(m.unemployment, 1, False), src.get("unemployment", "FRED unavailable")),
-        ("VIX / 3M / 6M", f"{num(m.vix, 1)} / {num(m.vix3m, 1)} / {num(m.vix6m, 1)}", "Yahoo"),
+        ("VIX / 3M / 6M", f"{num(m.vix, 1)} / {num(m.vix3m, 1)} / {num(m.vix6m, 1)}", src.get("vix_term", "Yahoo")),
         ("VVIX / SKEW", f"{num(m.vvix, 1)} / {num(m.skew, 1)}", "Yahoo"),
     ]
     for r in rows:
-        t.add_row(*r)
+        t.add_row(*(escape(str(c)) for c in r))       # sources carry text from the data providers
     console.print(t)
 
     if snap.holdings is not None and not snap.holdings.empty:
@@ -252,7 +253,7 @@ def render_metrics(fc: Forecast, console: Console) -> None:
             info = snap.info(sym)
             tpe, fpe = info.get("trailingPE"), info.get("forwardPE")
             ns = by_ticker.get(sym)
-            t.add_row(sym, str(row["name"])[:28], pct(row["weight"], 1, False),
+            t.add_row(escape(str(sym)), escape(str(row["name"])[:28]), pct(row["weight"], 1, False),
                       num(tpe, 1) if tpe else "n/a", num(fpe, 1) if fpe else "n/a",
                       pct(snap.change(sym, 21)) if snap.close(sym) is not None else "n/a",
                       f"{ns:+.2f}" if ns is not None else "n/a")
@@ -286,11 +287,12 @@ def render_news(fc: Forecast, console: Console, max_items: int = 5) -> None:
                                       (f"score {s.score:+.2f}  from {s.n_used} unique recent stories "
                                        f"({s.n_articles} fetched); near-term drift tilt {s.drift_adjustment:+.1%}/yr", "")),
                         title="News sentiment", box=box.ROUNDED))
+    # headlines, feed names and notes are outside text: escaped, so a '[/...]' in one is shown, not parsed
     for n in s.notes:
-        console.print(f"[dim]{n}[/dim]")
+        console.print(f"[dim]{escape(n)}[/dim]")
     if s.by_ticker:
         line = "  ".join(f"{k} {v:+.2f}" for k, v in sorted(s.by_ticker.items(), key=lambda kv: -abs(kv[1])))
-        console.print(f"[dim]By feed/company: {line}[/dim]")
+        console.print(f"[dim]By feed/company: {escape(line)}[/dim]")
     for title, items in (("Most positive (weighted)", s.top_positive), ("Most negative (weighted)", s.top_negative)):
         if not items:
             continue
@@ -301,8 +303,8 @@ def render_news(fc: Forecast, console: Console, max_items: int = 5) -> None:
         t.add_column("When")
         t.add_column("Headline")
         for x in items[:max_items]:
-            t.add_row(f"{x.score:+.2f}", f"{x.weight:.2f}", ",".join(dict.fromkeys(x.feeds))[:14],
-                      x.item.published.strftime("%m-%d %H:%M"), x.item.title[:110])
+            t.add_row(f"{x.score:+.2f}", f"{x.weight:.2f}", escape(",".join(dict.fromkeys(x.feeds))[:14]),
+                      x.item.published.strftime("%m-%d %H:%M"), escape(x.item.title[:110]))
         console.print(t)
 
 
@@ -319,8 +321,9 @@ def render_score(rep, console: Console, path: str) -> None:
         head.append("   |   model " + ", ".join(f"{v} ({n} rows)" for v, n in rep.versions.items()))
     console.print(Panel(head, title="Track record", box=box.ROUNDED))
     for n in rep.notes:
-        console.print(f"[yellow]note:[/yellow] {n}")
+        console.print(f"[yellow]note:[/yellow] {escape(n)}")        # notes carry paths and logged text
     if not rep.horizons:
+        _render_sentiment_score(rep, console)
         return
 
     def ci(pair, fmt: str) -> str:
@@ -348,15 +351,21 @@ def render_score(rep, console: Console, path: str) -> None:
     for hs in rep.horizons:
         skill = "n/a" if not math.isfinite(hs.crps_skill) else f"{hs.crps_skill:+.1%} {ci(hs.crps_skill_ci, '{:+.1%}')}"
         t.add_row(horizon_label(hs.horizon), str(hs.n), pct(hs.mean_realised_return),
-                  pct(hs.mean_predicted_median_return), f"{hs.crps_model:.4f}", f"{hs.crps_naive:.4f}", skill,
+                  pct(hs.mean_predicted_median_return), f"{hs.crps_model:.4f}",
+                  f"{hs.crps_naive:.4f}" if math.isfinite(hs.crps_naive) else "n/a", skill,
                   f"{hs.n_fine} fine / {hs.n - hs.n_fine} coarse grid")
     console.print(t)
+    partial = [f"{horizon_label(hs.horizon)} {hs.n_crps} of {hs.n}" for hs in rep.horizons if 0 < hs.n_crps < hs.n]
+    if partial:
+        console.print(f"[dim]CRPS and skill cover only the rows that logged the benchmark's inputs (VIX, T-bill, "
+                      f"cost): {', '.join(partial)}.[/dim]")
     console.print("[dim]PIT = where the realised price fell in the predicted distribution (0 = below everything, "
                   "1 = above everything). A mean far from 0.5 is bias; band coverage far from target is mis-sized "
                   "dispersion. Indep. = how many independent outcomes the rows amount to: forecasts a day apart share "
-                  "most of their window, so a year of daily 1-month forecasts holds about 12. Intervals appear once "
-                  "there are 3; until then the numbers are anecdotes, not evidence. Fine = the run's 103-point grid "
-                  "from the archive; coarse = the 9 logged quantiles.[/dim]")
+                  "most of their window, so a year of daily 1-month forecasts holds about 12. Intervals are on that "
+                  f"many observations and appear once there are {MIN_INDEPENDENT}; until then the numbers are "
+                  "anecdotes, not evidence. Fine = the run's 103-point grid from the archive; coarse = the 9 logged "
+                  "quantiles.[/dim]")
     if rep.by_rating:
         t = Table(title="Realised return at the rating horizon, by rating given", box=box.SIMPLE)
         for c in ("Rating", "n", "Mean realised return", "P(positive)"):
@@ -366,6 +375,10 @@ def render_score(rep, console: Console, path: str) -> None:
                 r = rep.by_rating[label]
                 t.add_row(label, str(r["n"]), pct(r["mean_return"]), pct(r["p_positive"], 0, False))
         console.print(t)
+    _render_sentiment_score(rep, console)
+
+
+def _render_sentiment_score(rep, console: Console) -> None:
     if rep.sentiment_n:
         corr = ("n/a (fewer than 10 pairs or no variation)" if rep.sentiment_corr is None
                 or not math.isfinite(rep.sentiment_corr) else f"{rep.sentiment_corr:+.2f}")
@@ -375,7 +388,7 @@ def render_score(rep, console: Console, path: str) -> None:
 
 def render_notes(fc: Forecast, console: Console) -> None:
     for n in fc.snap.notes:
-        console.print(f"[yellow]note:[/yellow] {n}")
+        console.print(f"[yellow]note:[/yellow] {escape(n)}")
 
 
 def render_all(fc: Forecast, console: Console, prices: Optional[List[float]] = None,

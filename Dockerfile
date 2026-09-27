@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY spxlcast ./spxlcast
 COPY scripts ./scripts
 COPY infra/daily.sh ./daily.sh
-RUN chmod +x ./daily.sh && mkdir -p /data/logs /data/output
+# Strip CRs: a Windows checkout can hand the build a CRLF daily.sh, which /bin/sh cannot run.
+RUN sed -i 's/\r$//' ./daily.sh && chmod +x ./daily.sh && mkdir -p /data/logs /data/output
 
 # The git commit the image is built from (the deploy workflow passes it with --build-arg); it is
 # logged with every forecast. Declared last so a new commit does not invalidate the layers above.

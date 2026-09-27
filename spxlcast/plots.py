@@ -9,7 +9,9 @@ from .pipeline import Forecast
 from .report import ordinal
 
 
-def save_fan_chart(fc: Forecast, path: str, prices: Optional[List[float]] = None) -> str:
+def save_fan_chart(fc: Forecast, path, prices: Optional[List[float]] = None, fmt: Optional[str] = None):
+    """Write the chart to ``path`` (a file name or a binary file object; ``fmt`` names the image format
+    when the name has no extension or a file object is given)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -50,6 +52,6 @@ def save_fan_chart(fc: Forecast, path: str, prices: Optional[List[float]] = None
     ax2.set_xlabel("price")
     ax2.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(path, dpi=130)
+    fig.savefig(path, dpi=130, format=fmt)
     plt.close(fig)
     return path

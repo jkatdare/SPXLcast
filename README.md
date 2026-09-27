@@ -52,9 +52,12 @@ python -m spxlcast --quiet --price 200
 
 Useful options (all subcommands): `--horizons 5 10 21 63 126 252`, `--rating-horizon 126`,
 `--paths 50000`, `--seed 42`, `--no-news`, `--no-fred`, `--no-macro-adj`, `--refresh` (bypass and
-rebuild the cache), and overrides `--index-drift 0.08`, `--vol 0.18`, `--pe 22`, `--div-yield 0.013`,
-`--eps-growth 0.055`, `--swap-spread 0.0075`, `--skew 1.0`, and `--archive DIR` (store the run's
-inputs, simulator arguments and scored headlines; see `spxlcast/archive.py`).
+rebuild the download cache; the price-history archive is kept), and overrides `--index-drift 0.08`,
+`--vol 0.18`, `--pe 22`, `--div-yield 0.013`, `--eps-growth 0.055`, `--swap-spread 0.0075`,
+`--skew 1.0`, and `--archive DIR` (store the run's inputs, simulator arguments and scored headlines;
+see `spxlcast/archive.py`). Prices must be positive and every number finite, `--seed` is a
+non-negative integer, and `--index-drift` must be above -50%, because each simulated path draws its
+drift up to 50 points either side of it.
 
 ## How to read the output
 
@@ -82,7 +85,9 @@ both views are used.
 
 The **buy-limit ladder** inverts this: it lists the prices with a 90/75/50/25/10% chance of being
 touched within the rating horizon, with the median end price and the chance of profit computed only
-over the paths on which the order fills.
+over the paths on which the order fills. At short horizons many paths never trade below the spot, so
+when no price below it has a 90% (or 75%) chance of filling, those rungs are replaced by one
+at-market rung at the spot, shown as 100%.
 
 ## Model
 
@@ -93,18 +98,25 @@ over the paths on which the order fills.
 
    plus small **regime penalties** for an inverted 10y-3m curve, high-yield spreads above 5%, CPI
    above 3.5% and a Sahm-rule labour signal, capped at 1.5% in total. Interest rates are charged to
-   SPXL once, through its financing cost, not through the drift. An optional countercyclical
-   valuation term (`valuation_sensitivity` in config) is off by default: over 1881-2023 it added no
-   predictive value to the blend (see the drift backtest below). The result is clipped to
-   [-10%, +20%]. Each simulated path draws its own drift from a normal with a 2% standard deviation
-   around this estimate, so the bands honestly reflect that the expected return is uncertain.
+   SPXL once, through its financing cost, not through the drift. CPI inflation and the Sahm gap are
+   computed on calendar months, not rows: a single missing month (BLS published no October 2025 CPI
+   or unemployment figures) is filled with the mean of its neighbours, and when the month a year
+   earlier is still missing, CPI inflation is reported unavailable and its penalty skipped. An
+   optional countercyclical valuation term (`valuation_sensitivity` in config) is off by default:
+   over 1881-2026 it added no predictive value to the blend (see the drift backtest below). The
+   result is clipped to [-10%, +20%]. Each simulated path draws its own drift from a normal with a
+   2% standard deviation around this estimate, so the bands honestly reflect that the expected
+   return is uncertain.
 2. **Volatility**: VIX / VIX3M / VIX6M less haircuts of 3 / 5 / 7 vol points (implied vol exceeds
    subsequently realised vol by more at longer tenors), converted into forward variances so the
-   total variance to each pillar matches; beyond six months the vol mean-reverts toward 16%. On top
-   of that term structure each path carries **stochastic volatility**: a persistent log-vol
-   deviation (AR(1), persistence 0.97, stationary sd 0.35) with a leverage effect (correlation -0.5
-   between today's return shock and tomorrow's vol), scaled so the average variance still matches
-   the term structure. This gives volatility clustering and realistic drawdown-touch probabilities.
+   total variance to each pillar matches; beyond six months the vol mean-reverts toward 16%. Just
+   after the open Yahoo has today's VIX but not yet today's VIX3M/VIX6M: those are then moved from
+   their last close with the VIX, by the beta of their daily log changes on the VIX's over the past
+   year, so all three pillars are of one instant. On top of that term structure each path carries
+   **stochastic volatility**: a persistent log-vol deviation (AR(1), persistence 0.97, stationary
+   sd 0.35) with a leverage effect (correlation -0.5 between today's return shock and tomorrow's
+   vol), scaled so the average variance still matches the term structure. This gives volatility
+   clustering and realistic drawdown-touch probabilities.
 3. **News sentiment**: stories within 7 days, deduplicated across feeds, weighted by recency
    (2-day half-life) and by relevance judged from the headline: a market-wide story counts fully
    on any feed, a story about one of the ten largest constituents counts in proportion to that
@@ -140,22 +152,40 @@ python -m spxlcast score          # PIT, band coverage, drawdown-touch hit rates
 
 The scorer is honest about overlap: forecasts a day apart share most of their outcome window, so
 each horizon reports how many independent outcomes the rows amount to (a year of daily 1-month
-forecasts holds about 12) and 90% intervals from a block bootstrap once there are at least three.
+forecasts holds about 12) and 90% intervals computed in closed form on that number of independent
+outcomes (a t interval for mean PIT and for CRPS skill, a Wilson interval for band coverage) once
+there are at least three; in simulations of perfectly calibrated forecasts the mean-PIT and skill
+intervals cover about 82-90% at three to seven independent outcomes and 88-93% from about a dozen on,
+and the band-coverage interval is conservative (94-98%).
 It also grades the whole distribution with CRPS against a naive lognormal at the raw VIX with a
 T-bill drift, and with `--archive DIR` it scores each run on its archived 103-point percentile
 grid rather than the nine logged quantiles.
 
 Any subcommand accepts `--log-file PATH` to append its run as well. The scorer keeps one row per
-spot date (a close beats an intraday quote) and needs the shortest horizon to elapse before it has
-anything to report. The 1-week and 2-week horizons exist for fast feedback: daily forecasts
-overlap, so a year of logging holds about 50 independent 1-week outcomes but only 12 1-month ones,
-and the news tilt only acts over the first 10 days.
+spot date: the run made on that New York day (a close beats an intraday quote, then the latest run).
+A later run that logs the same close (the winter 08:40 ET pre-open run, or a holiday run) counts only
+when nothing ran on the day itself. Each row is scored on the ratio of later closes to the close on
+its own date, so distributions and splits after the window (Yahoo back-adjusts its history) do not
+move a closed score. While the session is open, today's partial bar is not treated as a close. Until
+a forecast reaches its horizon, the score says which one resolves first. The 1-week and 2-week
+horizons exist for fast feedback: daily forecasts overlap, so a year of logging holds about 50
+independent 1-week outcomes but only 12 1-month ones, and the news tilt only acts over the first 10
+days. A row cut short by an interrupted write is moved to `logs/forecast_log.csv.partial`, and a
+rewrite that adds columns goes through a temporary file, so the log is never truncated.
 
 Each row also records `model_version` (`MODEL_VERSION` in `config.py`, bumped whenever a change
 alters the numbers a run produces), `build` (the git commit of the code), `data_flags` (input
 problems such as `fred:none` or `vix6m:missing`; empty when clean), `fred_series` and
 `news_fetched`. `score --model-version X` scores one version only; by default versions are pooled
-with a note when there is more than one.
+with a note when there is more than one. Besides missing inputs, `data_flags` marks stale ones:
+`fred:stale` (a daily FRED series more than five sessions behind, or a monthly one older than 100
+days), `spot:stale` (SPXL's last bar two or more sessions behind the index calendar), and
+`vix:stale`, `vix3m:stale` and `vix6m:stale` (that index is from an earlier session than the spot or
+another of the three, as on the 09:40 ET run, before Yahoo has today's VIX3M and VIX6M; those two
+are then moved with the VIX, see Model). `etf:uncalibrated` means there was no usable leverage
+calibration: a fit with R2 below `calibration_min_r2` (0.99) points to bad or mixed-basis prices and
+is rejected, so the run uses the stated 3x with no tracking noise and its notes say "calibration
+rejected".
 
 ## Hosting the daily run on Azure
 
@@ -167,7 +197,11 @@ price percentiles; the after-close run is the one the track record keeps. Betwee
 web app re-prices the latest forecast at the live SPXL quote every minute of the session (the
 simulated distribution is one of returns, so prices scale with the quote and the fixed price
 checks are re-read off stored percentile grids), shows that at the top of the page and records
-the quote in `logs/spot_log.csv`. The job and the web app are defined in `infra/job.yaml` and
+the quote in `logs/spot_log.csv`. That file's `base_run_at` names the full run in the track record's
+`run_at` form (`2026-09-22T21:40:21Z`); rows written before this form carry
+`2026-09-22T21:40:21.218019+00:00`, which must be floored to the second (never rounded) to join.
+Outside the session the loop fetches nothing: it marks the block closed after the bell and restates
+it at each new full run's own price. The job and the web app are defined in `infra/job.yaml` and
 `infra/web.yaml`; the image is built in the cloud by Azure Container Registry, so no local Docker
 is needed. From the repo root after `az login`:
 
@@ -179,14 +213,17 @@ is needed. From the repo root after `az login`:
 The FRED key is read from `.env` or the `FRED_API_KEY` environment variable and stored as a
 Container Apps secret. Approximate cost: the registry (Basic, about $5 a month) and the always-on
 web app (about $14 a month) are the fixed charges; the hourly job costs under $1 a month. `az group delete -n spxlcast-rg`
-removes everything. `python -m spxlcast serve --root DIR [--live]` runs the same status page
-(and, with `--live`, the minute loop) locally.
+removes everything. `python -m spxlcast serve --root DIR [--live] [--interval SECONDS]` runs the
+same status page (and, with `--live`, the minute loop; `--interval` sets the seconds between quotes,
+5 to 3600, default 60) locally.
 To run the steps by hand instead of through the script, follow `infra/DEPLOY.md`.
 
 Each job run also archives its inputs, exact simulator arguments and newly seen headlines on the
 share (`archive/`, not served by the page), and a scheduled GitHub workflow
 (`.github/workflows/healthcheck.yml`) checks the site four times a weekday, opening an issue when a
-scheduled run never logged, a run did not finish, the live price goes stale or the page is down.
+scheduled run never logged, a run did not finish, the live loop stopped writing during the session
+or before the close, the live quote has not moved for 30 minutes of the session (a feed answering
+with an old price), the score step failed or the page is down.
 See `infra/DEPLOY.md` sections 10 and Archive.
 
 ## Data notes
@@ -197,12 +234,19 @@ See `infra/DEPLOY.md` sections 10 and Archive.
   is converted to a bond-equivalent yield. Breakeven inflation then falls back to the configured
   default and the credit / CPI / unemployment adjustments are skipped.
 * When the session is open the spot, VIX and yields are live quotes; the header says `intraday`
-  instead of `close` and the price cache expires at the bell.
-* Results are cached in `.cache/` (prices 6h, fund info 12h, news 1h). Failed or empty fetches are
-  never cached. `--refresh` bypasses the cache and rebuilds it. Price history also accumulates in a
-  per-ticker archive, because Yahoo intermittently returns only the latest bar for `^VIX3M` and
-  `^VIX6M`; a partial response therefore never erases history already seen, and the metrics table
-  prints n/a for a window that falls into a gap rather than a misleading number.
+  instead of `close` and the price cache expires at the bell. The session follows the NYSE calendar
+  in `spxlcast/config.py` (`nyse_session`): holidays are closed all day, and early-close days (3 July
+  or 24 December from Monday to Thursday, and the day after Thanksgiving) close at 13:00, so the live
+  loop does not tick then and a job run after 13:00 ET on such a day logs the close.
+* Results are cached in `.cache/` (prices 6h, fund info 12h, news 30 min). Failed or empty fetches
+  are never cached. `--refresh` bypasses the download cache and rebuilds it; the per-ticker archive
+  is kept (delete `.cache/archive_*.pkl` to rebuild it). Price history accumulates in that archive, because Yahoo intermittently returns only the
+  latest bar for `^VIX3M` and `^VIX6M`; a partial response therefore never erases history already
+  seen, and the metrics table prints n/a for a window that falls into a gap rather than a misleading
+  number. The latest download wins on every date it covers: Yahoo re-adjusts its whole history at
+  each dividend or split, and older archived rows are rescaled to match. Today's bar is archived only
+  after the close, so an intraday price never stands in for a past session's close. Non-finite
+  closes, and zero or negative closes of stocks and funds, are dropped.
 * A 3x fund can lose most of its value in a sustained decline; the model's own 5% tail shows how
   large that risk is.
 
@@ -228,22 +272,32 @@ at 6 months) for SPY and SPXL alike, because the index returned about 15% a year
 against the 7% assumed; that is the sample, not the fund mechanics.
 
 **Drift model.** The second script rebuilds the expected-return model month by month from 1881
-with Shiller's data (now published at shillerdata.com; the script finds the current file there)
-and compares it with the realised nominal total return over the next 1, 5 and 10 years. Over
-1881-2026 the model's drift carries real information (correlation 0.23 / 0.47 / 0.61 with realised
-returns at 1 / 5 / 10 years) and beats a constant 7% on error at every horizon, with a bias of
--1.6% at one year and under 0.3% at five and ten. The valuation term added nothing to this and
-biased the post-1990 era low, which is why it is off by default. Over 2016-2023 the model would
-have said about 6% a year while the market delivered 12-15%, which explains the upward bias in the
+with Shiller's data (now published at shillerdata.com; the script finds the current file there and
+warns if it has to fall back to the Yale copy, which stopped updating in 2023) and compares it with
+the realised nominal total return over the next 1, 5 and 10 years. Over 1881-2026 the model's drift
+carries real information (correlation 0.22 / 0.47 / 0.60 with realised returns at 1 / 5 / 10
+years) and beats a constant 7% on error at every horizon, with a bias of -1.6% at one year and
+0.2% or less at five and ten. The optional valuation term, tried at the 0.5 sensitivity it was
+built with, added nothing (correlation 0.22 / 0.45 / 0.60, and a larger error at five and ten
+years) and pulled the post-1990 forecasts further below a market that kept re-rating upward, which
+is why it is off by default. Since 1990 the model has run low (bias -4.8% a year at one year,
+-3.1% at five, -1.6% at ten): over the engine backtest's window, 2016-09 to 2026-06, it would have
+said about 6.6% a year while the S&P 500 returned 15.4%, which explains the upward bias in the
 engine backtest.
 
 **Full model and rating.** The third script runs the live model's own functions at every month-end
-from 1990 to 2026 (440 of them) on data available at the time: Shiller earnings and dividends
-lagged three months, the 10-year breakeven from 2003 (trailing CPI inflation before), FRED rates,
-credit spreads, CPI and unemployment as released, and the VIX curve (VIX3M/VIX6M imputed from the
-VIX before 2008). Outcomes are SPXL from 2009 and, before that, a synthetic 3x fund that tracks
-SPXL with 0.998 daily correlation and a 0.3%/yr gap where both exist. Intervals account for
-overlapping windows (the 434 six-month outcomes amount to about 73 independent ones). Findings:
+from 1990 to 2026 (440 of them) on data available at the time: Shiller earnings and dividends of
+the last quarter already reported (two months after it ends; Shiller interpolates the months in
+between, so reading one of those would leak part of an unreported quarter), the 10-year breakeven
+from 2003 (trailing CPI inflation before), FRED rates, CPI and unemployment as released (CPI
+inflation and the Sahm gap by calendar month, through the live model's own functions), and the
+VIX curve (VIX3M/VIX6M imputed from the VIX before 2008). One regime input is missing: FRED keeps
+only three years of the ICE BofA high-yield spread, so the credit-stress penalty cannot fire at
+404 of the 440 month-ends (before 2023-09), including every credit crisis in the sample; the report
+says so. Outcomes are SPXL from 2009 and, before that, a synthetic 3x fund that tracks SPXL with
+0.998 daily correlation and a 0.3%/yr gap where both exist. The 90% intervals are computed in
+closed form on the number of independent outcome windows (the 434 six-month outcomes amount to
+about 73 independent ones), the same construction as the track record's. Findings:
 
 * The forecast distribution is well calibrated and beats a naive benchmark. The 90% band held
   91-93% of outcomes from one week to six months, and the model's CRPS is 3% (1 week) to 15%
@@ -251,13 +305,15 @@ overlapping windows (the 434 six-month outcomes amount to about 73 independent o
   zero at every horizon. The median is slightly low (mean PIT 0.54-0.57) and the chance of a 20%
   dip is overstated by 4-6 points at 3-6 months.
 * The fundamentals drift adds nothing measurable at these horizons: against the same engine with
-  a constant 7% drift, 6-month skill is +0.4% (90% interval -0.6% to +1.5%). Valuation predicts
+  a constant 7% drift, 6-month skill is +0.4% (90% interval -0.9% to +1.7%). Valuation predicts
   5-10 year returns (above), not the next six months.
 * The rating does not predict returns. Rank correlation of the score with the next 6 months'
-  SPXL excess return is -0.03 (-0.18 to +0.12); months rated BUY did no better than the rest
-  (-3.8%, -13.7% to +5.7%). The label mostly tracks financing cost and volatility: BUY in 81-86%
-  of months in the zero-rate years 2008-2021, HOLD in 95% since 2022. SELL fired in 12 months
-  (autumn 1998, late 2000, October 2008 to March 2009, March 2020), mostly at volatility spikes
-  near market bottoms, and SPXL averaged +38% over the following six months. No BUY/SELL threshold
-  worked in both halves of the sample, so the thresholds are left unchanged; treat the rating as
-  a summary of the risk-reward the model sees, not a timing signal.
+  SPXL excess return is -0.03 (-0.22 to +0.17); months rated BUY did no better than the rest
+  (-4.2%, -18.0% to +9.6%). The label mostly tracks financing cost and volatility: BUY in 83% of
+  months in the low-rate years 2008-2021, HOLD in 95% since 2022. SELL fired in 12 months
+  (August-September 1998, October-December 2000, October 2008 to March 2009, March 2020), mostly
+  at volatility spikes near market bottoms. SPXL averaged +39% over the following six months but
+  beat T-bills in only half of them; four episodes are far too few to tell (+26% more than the
+  other months, 90% interval -53% to +105%). No BUY/SELL threshold worked in both halves of the
+  sample, so the thresholds are left unchanged; treat the rating as a summary of the risk-reward
+  the model sees, not a timing signal.

@@ -1,12 +1,25 @@
+# Patterns match from the build-context root only; the **/ forms catch the same names below it.
 .git
+.claude
 .cache
+**/.cache
 output
+**/output
 logs
+**/logs
 .env
 *.env
+**/.env
+**/*.env
+.env.*
+**/.env.*
 __pycache__
+**/__pycache__
 *.pyc
+**/*.pyc
+*.egg-info
 .pytest_cache
 .venv
 tests
 archive
+**/archive

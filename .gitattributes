@@ -1,0 +1,4 @@
+# Files that run or are parsed in the Linux container keep LF endings in every checkout, including
+# Windows ones with core.autocrlf=true (a CRLF daily.sh cannot run; the Dockerfile also strips CRs).
+*.sh text eol=lf
+Dockerfile text eol=lf

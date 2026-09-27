@@ -11,17 +11,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
+import time
 from dataclasses import replace
 from typing import List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 
 from .config import Config
 from .pipeline import forecast_to_dict, run_forecast
 from .report import ordinal, render_all, render_score
-from .tracklog import DEFAULT_LOG, append_log, score_log
+from .tracklog import DEFAULT_LOG, NO_PRICES, append_log, score_log
 
 COMMANDS = ("forecast", "price", "metrics", "news", "calibrate", "log", "score")
 
@@ -33,24 +36,39 @@ def _positive_int(text: str) -> int:
     return v
 
 
-def _positive_float(text: str) -> float:
+def _nonnegative_int(text: str) -> int:
+    v = int(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return v
+
+
+def _finite_float(text: str) -> float:
     v = float(text)
+    if not math.isfinite(v):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    return v
+
+
+def _positive_float(text: str) -> float:
+    v = _finite_float(text)
     if v <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return v
 
 
 def _nonnegative_float(text: str) -> float:
-    v = float(text)
+    v = _finite_float(text)
     if v < 0:
         raise argparse.ArgumentTypeError("must not be negative")
     return v
 
 
 def _drift_float(text: str) -> float:
-    v = float(text)
-    if v <= -1.0 or v > 5.0:
-        raise argparse.ArgumentTypeError("must be an annual return above -100% (e.g. 0.08)")
+    # each simulated path draws its drift up to 50 points either side of this, and must stay above -100%
+    v = _finite_float(text)
+    if v <= -0.5 or v > 5.0:
+        raise argparse.ArgumentTypeError("must be an annual return above -50% and at most 500% (e.g. 0.08)")
     return v
 
 
@@ -62,22 +80,23 @@ def _paths_int(text: str) -> int:
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--price", type=float, action="append", default=None,
+    p.add_argument("--price", type=_positive_float, action="append", default=None,
                    help="price level to locate in the distribution (repeatable)")
     p.add_argument("--horizons", type=_positive_int, nargs="+", default=None, help="horizons in trading days (default 5 10 21 63 126 252)")
     p.add_argument("--rating-horizon", type=_positive_int, default=None, help="horizon used for the rating (default 126)")
     p.add_argument("--paths", type=_paths_int, default=None, help="Monte Carlo paths (default 50000)")
-    p.add_argument("--seed", type=int, default=None, help="random seed (default 42)")
+    p.add_argument("--seed", type=_nonnegative_int, default=None, help="random seed (default 42)")
     p.add_argument("--no-news", action="store_true", help="skip news sentiment")
     p.add_argument("--no-fred", action="store_true", help="skip FRED macro series")
     p.add_argument("--no-macro-adj", action="store_true", help="disable valuation/regime adjustments to the index drift")
-    p.add_argument("--refresh", action="store_true", help="ignore the on-disk cache (still refreshes it)")
+    p.add_argument("--refresh", action="store_true",
+                   help="ignore the download cache (still refreshes it; the price-history archive is kept)")
     p.add_argument("--index-drift", type=_drift_float, default=None, help="override S&P 500 expected total return, e.g. 0.08")
     p.add_argument("--vol", type=_nonnegative_float, default=None, help="override annualised index vol, e.g. 0.18")
-    p.add_argument("--pe", type=float, default=None, help="override trailing P/E of the index")
-    p.add_argument("--div-yield", type=float, default=None, help="override dividend yield, e.g. 0.013")
-    p.add_argument("--eps-growth", type=float, default=None, help="override long-run nominal EPS growth, e.g. 0.055")
-    p.add_argument("--swap-spread", type=float, default=None, help="override the all-in financing spread, e.g. 0.0075")
+    p.add_argument("--pe", type=_finite_float, default=None, help="override trailing P/E of the index")
+    p.add_argument("--div-yield", type=_finite_float, default=None, help="override dividend yield, e.g. 0.013")
+    p.add_argument("--eps-growth", type=_finite_float, default=None, help="override long-run nominal EPS growth, e.g. 0.055")
+    p.add_argument("--swap-spread", type=_finite_float, default=None, help="override the all-in financing spread, e.g. 0.0075")
     p.add_argument("--skew", type=_positive_float, default=None, help="daily shock skew gamma (1 = symmetric, default 0.9)")
     p.add_argument("--log-file", dest="log_file", default=None,
                    help=f"append this run's forecast to a track-record CSV (default for `log`/`score`: {DEFAULT_LOG})")
@@ -96,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fc = sub.add_parser("forecast", help="full report (default)")
     _add_common(p_fc)
     p_pr = sub.add_parser("price", help="locate one or more prices in the forecast distribution")
-    p_pr.add_argument("prices", type=float, nargs="+")
+    p_pr.add_argument("prices", type=_positive_float, nargs="+")
     _add_common(p_pr)
     for name, help_text in (("metrics", "influencer levels, valuation and macro"), ("news", "news sentiment"),
                             ("calibrate", "leveraged-ETF calibration and drivers"),
@@ -182,14 +201,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         rep = score_log(args.log_file or DEFAULT_LOG, cfg=cfg, model_version=args.model_version,
                         archive_dir=args.archive_dir)
         render_score(rep, console, args.log_file or DEFAULT_LOG)
-        return 0
+        return 1 if NO_PRICES in rep.notes else 0
 
     with console.status("Fetching data and simulating...", spinner="dots"):
         fc = run_forecast(cfg)
 
     log_file = args.log_file or (DEFAULT_LOG if args.command == "log" else None)
+    logged = None
     if log_file:
-        append_log(fc, log_file)
+        try:
+            append_log(fc, log_file)
+        except Exception as exc:  # noqa: BLE001 - still write the outputs; the run then exits non-zero
+            logged = exc
     archived = None
     if args.archive_dir:
         from .archive import archive_run
@@ -197,6 +220,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             archived = archive_run(fc, args.archive_dir, prices)
         except Exception as exc:  # noqa: BLE001 - the forecast and the track record matter more
             archived = exc
+
+    # Outputs are written before the report is rendered, so a rendering problem cannot leave a logged
+    # run without its forecast.json / fan.png.
+    if args.json_path:
+        doc = forecast_to_dict(fc, prices)
+        _write_atomic(args.json_path, lambda fh: fh.write(
+            json.dumps(doc, indent=2, default=str, allow_nan=False).encode("utf-8")))
+    if args.plot_path:
+        from .plots import save_fan_chart
+        fmt = os.path.splitext(args.plot_path)[1].lstrip(".") or None
+        _write_atomic(args.plot_path, lambda fh: save_fan_chart(fc, fh, prices, fmt=fmt))
 
     if args.quiet or args.command == "log":
         console.print(f"{cfg.etf} {fc.spot:,.2f} ({fc.spot_status} {fc.spot_date})  rating {fc.rating.label} "
@@ -208,8 +242,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             r = next(x for x in rows if x["horizon"] == fc.rating.horizon)
             console.print(f"  price {p:,.2f}: {ordinal(r['percentile'])} percentile at {fc.rating.horizon}d, "
                           f"P(dips to it) {r['p_touch_below']:.0%}, P(rises to it) {r['p_touch_above']:.0%}")
-        if log_file:
-            console.print(f"[dim]appended to {log_file}[/dim]")
+        if log_file and logged is None:
+            console.print(f"appended to {log_file}", style="dim", markup=False, highlight=False)
     else:
         sections = {
             "forecast": None,
@@ -218,25 +252,50 @@ def main(argv: Optional[List[str]] = None) -> int:
             "news": {"header", "news", "notes"},
             "calibrate": {"header", "drivers", "sensitivity", "notes"},
         }[args.command]
-        render_all(fc, console, prices=prices, sections=sections)
-        if log_file:
-            console.print(f"[dim]appended to {log_file}[/dim]")
+        try:
+            render_all(fc, console, prices=prices, sections=sections)
+        except Exception as exc:  # noqa: BLE001 - the report is presentation; the run's outputs are written
+            logging.getLogger(__name__).debug("report rendering failed", exc_info=True)
+            console.print(f"warning: the report could not be rendered in full: {type(exc).__name__}: {exc}",
+                          style="yellow", markup=False, highlight=False)
+        if log_file and logged is None:
+            console.print(f"appended to {log_file}", style="dim", markup=False, highlight=False)
     if isinstance(archived, Exception):
-        console.print(f"[yellow]warning: archive failed: {archived}[/yellow]")
+        console.print(f"[yellow]warning: archive failed: {escape(str(archived))}[/yellow]")
     elif archived:
         console.print(f"[dim]archived {archived['run']} ({archived['new_stories']} new stories)[/dim]")
-
-    if args.json_path:
-        os.makedirs(os.path.dirname(os.path.abspath(args.json_path)), exist_ok=True)
-        with open(args.json_path, "w", encoding="utf-8") as fh:
-            json.dump(forecast_to_dict(fc, prices), fh, indent=2, default=str, allow_nan=False)
-        console.print(f"[dim]wrote {args.json_path}[/dim]")
-    if args.plot_path:
-        from .plots import save_fan_chart
-        os.makedirs(os.path.dirname(os.path.abspath(args.plot_path)), exist_ok=True)
-        save_fan_chart(fc, args.plot_path, prices)
-        console.print(f"[dim]wrote {args.plot_path}[/dim]")
+    for path in (args.json_path, args.plot_path):
+        if path:
+            console.print(f"wrote {path}", style="dim", markup=False, highlight=False)
+    if logged is not None:
+        console.print(f"error: the run was not logged to {log_file}: {type(logged).__name__}: {logged}",
+                      style="red", markup=False, highlight=False)
+        return 1
     return 0
+
+
+def _write_atomic(path: str, write) -> None:
+    """Write through a temp file in the same directory and rename it into place, so a reader (the live
+    loop, a download) never sees a truncated or half-written file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.urandom(6).hex()}.tmp"    # unique: a manual run may overlap the scheduled one
+    try:
+        with open(tmp, "xb") as fh:
+            write(fh)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:     # Windows: a reader (the live loop) holds the file open for a moment
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover

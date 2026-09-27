@@ -17,6 +17,11 @@ Steps 0 to 7 are done and the pipeline works: the job ran at 22:13 UTC, logged a
 Remaining: step 8 (point `spxlcast.com` at it) and step 9 (GitHub auto-deploy, optional). The
 earlier steps are kept below as the record of how it was built and for rebuilding from scratch.
 
+Update 2026-09-26: `https://spxlcast.com` is live. `www.spxlcast.com` is **not**: its Cloudflare
+records exist, but the hostname was never added and bound on the app, so `https://www.spxlcast.com`
+fails the TLS handshake and `http://www.spxlcast.com` returns Azure's 404. The `hostname add` and
+`hostname bind` commands under "Also serving www.spxlcast.com" (step 8) finish it.
+
 Two problems hit on the way, both fixed here: creating a resource before its provider is
 registered fails with the misleading `SubscriptionNotFound`, and the web spec must set
 `ingress.allowInsecure: false` explicitly or the CLI sends `null` and the API rejects it.
@@ -46,13 +51,17 @@ az group create -n spxlcast-rg -l eastus2 -o none
 
 ```powershell
 az acr create -n spxlcastacr -g spxlcast-rg --sku Basic --admin-enabled true -o none
-az acr build -r spxlcastacr -t spxlcast:latest --build-arg "SPXLCAST_BUILD=$(git rev-parse HEAD)" . -o none
+$build = git rev-parse --short=12 HEAD
+if (git status --porcelain --untracked-files=normal spxlcast scripts infra/daily.sh Dockerfile requirements.txt pyproject.toml) { $build = $build.Substring(0, 6) + "-dirty" }
+az acr build -r spxlcastacr -t spxlcast:latest --build-arg "SPXLCAST_BUILD=$build" . -o none
 ```
 
-`az acr build` uploads the repo (minus `.dockerignore` entries, so never `.env`) and builds the
-Dockerfile in Azure. Re-run it whenever the code changes, or let the GitHub workflow do it. The
-build argument stamps the image with the git commit, which every logged forecast records in its
-`build` column (without it the column says `unknown`).
+`az acr build` uploads the working tree (minus `.dockerignore` entries, so never a `.env` at any
+depth) and builds the Dockerfile in Azure. Re-run it whenever the code changes, or let the GitHub
+workflow do it. The build argument stamps the image with the git commit, which every logged
+forecast records in its `build` column (without it the column says `unknown`). Uncommitted or
+untracked changes to the shipped files are uploaded too, so the stamp then reads `<sha>-dirty`
+(the sha cut to 6 characters, since the column keeps 12).
 
 ## 3. Storage account and file share
 
@@ -103,7 +112,7 @@ foreach ($f in "job", "web") {
   foreach ($k in $fill.Keys) { $text = $text.Replace('${' + $k + '}', [string]$fill[$k]) }
   Set-Content "$env:TEMP\spxlcast-$f.yaml" $text -Encoding utf8
 }
-Select-String -Path "$env:TEMP\spxlcast-*.yaml" -Pattern '\$\{'     # must print nothing: no placeholder left
+Select-String -Path "$env:TEMP\spxlcast-*.yaml" -Pattern '\$\{[A-Z0-9_]+\}'     # must print nothing: no placeholder left
 ```
 
 The cron expression is UTC and runs hourly at :40 from 13:40 to 21:40, weekdays. In summer that is
@@ -111,11 +120,14 @@ The cron expression is UTC and runs hourly at :40 from 13:40 to 21:40, weekdays.
 one run after the close. Intraday runs log live quotes (marked `intraday`); the after-close run logs
 the close, and the scorer keeps that one row per date. While the session is open the price cache
 expires after 30 minutes so each hourly run sees a fresh quote. On market holidays the job simply
-logs the previous close.
+logs the previous close, and on 13:00 early-close days the runs after 13:00 ET log the close. In
+winter the 13:40 UTC run is before the open and also logs the previous close; the scorer ignores it
+in favour of the run made on the day.
 
 The GitHub workflow re-applies this cron expression (and the retry limit) on every deploy, so a
 schedule changed by hand is overwritten by the next push; change `CRON` in
-`.github/workflows/deploy.yml` instead.
+`.github/workflows/deploy.yml` instead, and `SCHEDULE` in `spxlcast/health.py` with it (a test
+fails while they differ).
 
 ## 6. Scheduled job
 
@@ -128,7 +140,23 @@ az containerapp job logs show -n spxlcast-daily -g spxlcast-rg --container spxlc
 
 "Additional flags were passed along with --yaml" is only a warning about `-o none`; ignore it.
 The first run takes a minute or two (it downloads five years of history into the share's cache);
-later runs reuse it. The logs end with the one-line rating and the first lines of the score.
+later runs reuse it. The logs end with any `warning:` line of the report, the report's last lines
+(what the run appended, archived and wrote) and the first lines of the score.
+
+The page's report and track record are replaced only when their step succeeds. A failed forecast
+fails the execution and leaves the previous report up; its output is in the logs and in
+`last_error.txt` at the root of the share, which the page does not serve. A failed score step
+(including a price download that returns nothing) keeps the previous track record, does not fail
+the execution (a retry would re-run the forecast) and leaves `output/score_error.txt`, which the
+health check reports.
+
+`forecast.json` and `fan.png` are replaced atomically (a temporary file, then a rename), so the live
+loop and downloads never see a partial file, and the forecast command writes them before it renders
+the report. If rendering fails, `report.txt` holds a `warning: the report could not be rendered in
+full: ...` line after the sections that did render (the job log repeats it), but the command still
+exits 0 with the log row, the archive, `forecast.json` and `fan.png` all written; run it with `-v`
+for the full traceback. If the log row cannot be appended, the outputs are still written and the
+command exits 1, so the execution fails and is retried.
 
 ## 7. Status page
 
@@ -145,8 +173,13 @@ Open `https://<that hostname>`. The app is always on (one replica): besides serv
 runs the live loop (`serve --live`, also switched on by `SPXLCAST_LIVE=1`, which the image sets),
 which every minute of the regular session fetches the SPXL quote, restates the last full forecast
 at that price into `output/live.json` and appends a row to `logs/spot_log.csv`. The page shows
-that block at the top and refreshes itself every minute. `/logs/forecast_log.csv`,
-`/logs/spot_log.csv`, `/output/forecast.json` and `/output/live.json` are direct downloads.
+that block at the top and refreshes itself every minute during the session (every five minutes
+otherwise). Outside the session the loop fetches no quotes. After the close it marks `live.json`
+closed at the last quote. After each full run outside the session (the after-close runs, and the
+winter pre-open run) it restates `live.json` at that run's own price, so the block always matches
+the report below it. `/logs/forecast_log.csv`, `/logs/spot_log.csv`, `/output/forecast.json` and
+`/output/live.json` are direct downloads. Only files inside `output/` and `logs/` are served (no
+directory listings; HEAD answers like GET).
 
 To switch an existing deployment from scale-to-zero to always on without re-running the whole
 script (the workflow also does this on every deploy):
@@ -236,7 +269,12 @@ needs editing if the environment's address changes. Add two more Cloudflare reco
 
 The verification ID belongs to the app, not to the hostname, so both TXT records carry the same
 value. Then add and bind it, using CNAME validation this time. CNAME validation checks the record
-above, so unlike the apex this needs no `_acme-challenge` record:
+above, so unlike the apex this needs no `_acme-challenge` record.
+
+**Not done yet (2026-09-26):** both records above are in Cloudflare, but `hostname add` and
+`hostname bind` below have not been run, so `www.spxlcast.com` does not work: HTTPS resets during
+the handshake (the app has no binding or certificate for that name) and HTTP gets Azure's 404. Run
+them to finish it:
 
 ```powershell
 az containerapp hostname add -n spxlcast-web -g spxlcast-rg --hostname www.spxlcast.com
@@ -245,10 +283,14 @@ az containerapp hostname bind -n spxlcast-web -g spxlcast-rg --hostname www.spxl
 az containerapp hostname list -n spxlcast-web -g spxlcast-rg -o table
 ```
 
-Both names now serve the page, each with its own free managed certificate. If you would rather
-have one canonical address, skip the binding and instead set the `www` record to Proxied (orange)
-with a Cloudflare redirect rule sending `www.spxlcast.com` to `spxlcast.com`. That needs no Azure
-work and no second certificate, but the redirect is configured in Cloudflare rather than here.
+Once `hostname list` shows `www.spxlcast.com` as `SniEnabled`, both names serve the page, each
+with its own free managed certificate. `infra/web.yaml` lists no custom domains, and `deploy.ps1`
+re-applies it to an existing app (`containerapp update --yaml`; the GitHub workflow only swaps the
+image): after re-running the script, check `hostname list` and bind again if a name is gone. If you
+would rather have one canonical address, skip the binding and instead set the `www` record to
+Proxied (orange) with a Cloudflare redirect rule sending `www.spxlcast.com` to `spxlcast.com`. That
+needs no Azure work and no second certificate, but the redirect is configured in Cloudflare rather
+than here. If `www` is not wanted at all, delete its CNAME and `asuid.www` TXT records instead.
 
 ## 9. GitHub auto-deploy (optional)
 
@@ -294,19 +336,35 @@ that lets it build in the registry and update the apps; it cannot touch anything
 ## 10. Health check and alerts
 
 `.github/workflows/healthcheck.yml` checks the live site from GitHub at 15:05, 17:05, 19:05 and
-22:15 UTC on weekdays (`spxlcast/health.py`, standard library only). It fails when:
+22:15 UTC on weekdays (`spxlcast/health.py`, standard library only; its `CHECKS` must match the
+workflow's cron lines and its `SCHEDULE` the job's, which a test enforces). It fails when:
 
-- a scheduled job run in the last 3.5 hours never logged a forecast (each run is covered by one or
-  two checks, so a missed run is reported once or twice, never silently);
-- `output/forecast.json` is older than the latest logged run (the run did not finish its outputs);
-- `output/live.json` is more than 10 minutes old during the session (the live loop has stopped);
-- the latest run priced SPXL more than 4 days ago (stale price feed), or `/healthz` is down.
+- a scheduled job run since the check before the previous one never logged a forecast. Every run
+  is judged by two checks, so one dropped or late check (GitHub delays and sometimes drops
+  scheduled workflows) still reports it; Monday's first check covers Friday evening;
+- `output/forecast.json` is older than the latest logged run that is at least 15 minutes old (that
+  run did not finish its outputs);
+- `output/live.json` is more than 10 minutes old during the session, or, outside it, stopped more
+  than 10 minutes before the last close (the live loop has stopped), or is not a JSON object with
+  the time it was written. The session follows the NYSE calendar in `spxlcast/config.py` that the
+  loop and the page use: no ticks on holidays, 13:00 closes on early-close days;
+- during the session, the quote in `live.json` has not changed for 30 minutes (its `spot_since`):
+  the quote feed keeps answering with an old price. SPXL's minute quotes repeat for a few minutes
+  at most;
+- the latest run priced SPXL more than two sessions before today (stale price feed);
+- `/healthz` is down, or `/` does not return the status page;
+- the latest score step failed (the job keeps the previous track record on the page and leaves
+  `output/score_error.txt`).
 
 Data problems flagged by the latest run (the `data_flags` column, for example `fred:none`) are
 reported as warnings without failing. On failure it opens an issue labelled `health-check` (later
-failures comment on it), fails the workflow run so GitHub sends its failed-workflow email, and
-closes the issue once a check passes again. Nothing to set up beyond pushing the file; the
-workflow's own token opens the issues. It uses about 90 of the 2,000 free Actions minutes a month.
+failures comment on it) and fails the workflow run so GitHub sends its failed-workflow email. The
+issue is closed by the next passing check, scheduled or manual, made while the session is open
+(`health.py` tells the workflow through the step output `live_checked`): a pass at 22:15, on a
+holiday, after an early close or delayed past the bell cannot see the live loop at work, so it
+leaves the issue open until the next session's checks (close it by hand if the fix is certain).
+Nothing to set up beyond pushing the file; the workflow's own token opens the issues. It uses about
+90 of the 2,000 free Actions minutes a month.
 Run it by hand with `gh workflow run healthcheck.yml`, or locally:
 
 ```powershell
@@ -319,10 +377,13 @@ Every job run also writes, on the file share under `archive/`:
 
 - `runs/YYYY-MM-DD/HHMMSSZ.json.gz`: the run's inputs (latest market and FRED values, holdings,
   data flags, package versions), the exact simulator arguments and the full forecast. With the same
-  build, `spxlcast.archive.replay(load_run(path))` reproduces the simulation exactly.
-- `news/YYYY-MM.jsonl`: every headline the model scored, once, at its first sighting, with its
-  text, score and relevance. Yahoo only serves the latest headlines, so this is the only history
-  the news tilt can later be calibrated on.
+  build, `spxlcast.archive.replay(load_run(path))` reproduces the simulation exactly. A second run
+  in the same UTC second is stored as `HHMMSSZ-1.json.gz` instead of overwriting the first.
+- `news/YYYY-MM.jsonl`: every headline the model scored, once per story and headline, at its first
+  sighting (a headline rewritten under the same URL is stored again with the same key), with its
+  text, score and relevance. Lines are ASCII JSON (non-ASCII characters are `\u` escapes; read
+  them with `json.loads`). Yahoo only serves the latest headlines, so this is the only history the
+  news tilt can later be calibrated on.
 
 The status page does not serve it (it holds publishers' headline text). Download it with:
 
@@ -335,12 +396,20 @@ It grows by roughly 100 MB a year, well within the 5 GB share.
 
 ## Updating and removing
 
-- Code changes: push to `master` (with the workflow), or by hand
-  `az acr build -r spxlcastacr -t spxlcast:latest --build-arg "SPXLCAST_BUILD=$(git rev-parse HEAD)" . -o none` followed by
+- Code changes: push to `master` (with the workflow), or by hand the three build lines of step 2
+  (they stamp a build from uncommitted changes `-dirty`) followed by
   `az containerapp job update -n spxlcast-daily -g spxlcast-rg --image spxlcastacr.azurecr.io/spxlcast:latest -o none`
   and the same `az containerapp update` for `spxlcast-web`.
-- Change the schedule: edit `CRON` in `.github/workflows/deploy.yml` and push (or, until the next
-  push, `az containerapp job update -n spxlcast-daily -g spxlcast-rg --cron-expression "..." -o none`).
+- Optional, once after deploying model 0.3.0: earlier builds could archive price rows from two
+  dividend bases in `.cache/archive_*.pkl` on the share. The first run of the new build rewrites
+  every archived row inside the five-year download window, which is all the model reads, so this
+  is not required; to rebuild the older rows too, delete those files once, with `$key` as in the
+  Archive section (`az storage file delete-batch --account-name spxlcastsa --account-key $key
+  -s spxlcast --pattern ".cache/archive_*.pkl"`, first with `--dryrun`). `--refresh` no longer
+  resets them.
+- Change the schedule: edit `CRON` in `.github/workflows/deploy.yml` and `SCHEDULE` in
+  `spxlcast/health.py`, and push (or, until the next push,
+  `az containerapp job update -n spxlcast-daily -g spxlcast-rg --cron-expression "..." -o none`).
 - Is it alive? `https://spxlcast.com/output/live.json` should be under two minutes old during the
   session; `az containerapp logs show -n spxlcast-web -g spxlcast-rg --tail 50` shows the loop, and
   `az containerapp job execution list -n spxlcast-daily -g spxlcast-rg -o table` the hourly runs.

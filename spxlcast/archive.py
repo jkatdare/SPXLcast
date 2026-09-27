@@ -6,7 +6,10 @@ better sentiment model) later. Each run also stores the exact arguments passed t
 so any logged forecast can be reproduced with the same build (see ``replay``).
 
     <root>/runs/YYYY-MM-DD/HHMMSSZ.json.gz   one file per run: inputs, simulator arguments, forecast
-    <root>/news/YYYY-MM.jsonl                 one line per story, written at its first sighting
+                                             (HHMMSSZ-1.json.gz, ... for later runs in the same second)
+    <root>/news/YYYY-MM.jsonl                 one line per story and headline, written at its first
+                                             sighting (a headline rewritten under the same URL gets a
+                                             new line with the same key)
 
 The hosted job writes it to the file share (``/data/archive``). The status page does not serve it,
 because it holds publishers' headline text.
@@ -17,9 +20,10 @@ import gzip
 import json
 import os
 import platform
+import tempfile
 from datetime import datetime, timedelta, timezone
 from importlib import metadata
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -91,11 +95,29 @@ def write_run(root: str, record: Dict[str, Any]) -> str:
     stamp = _utc(record["run_at"]).astimezone(timezone.utc)
     folder = os.path.join(root, "runs", stamp.strftime("%Y-%m-%d"))
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, stamp.strftime("%H%M%SZ") + ".json.gz")
-    tmp = path + ".tmp"
-    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
-        json.dump(record, fh, separators=(",", ":"), allow_nan=False)
-    os.replace(tmp, path)      # a crash never leaves a truncated record behind
+    name = stamp.strftime("%H%M%SZ")
+    fd, tmp = tempfile.mkstemp(prefix=name + ".", suffix=".tmp", dir=folder)
+    claimed = None
+    try:
+        with os.fdopen(fd, "wb") as raw, gzip.open(raw, "wt", encoding="utf-8") as fh:
+            json.dump(record, fh, separators=(",", ":"), allow_nan=False)
+        # claim a free name atomically, so a second run in the same second never overwrites the first
+        n = 0
+        while True:
+            path = os.path.join(folder, f"{name}-{n}.json.gz" if n else f"{name}.json.gz")
+            try:
+                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                claimed = path
+                break
+            except FileExistsError:
+                n += 1
+        os.replace(tmp, path)      # a crash never leaves a truncated record behind
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if claimed and os.path.exists(claimed) and os.path.getsize(claimed) == 0:
+            os.remove(claimed)     # the empty placeholder of a claim that was never filled
+        raise
     return path
 
 
@@ -118,9 +140,8 @@ def replay(record: Dict[str, Any], which: str = "sim_inputs") -> SimulationResul
 # ---------------------------------------------------------------------------------------
 def story_key(url: str, title: str, published: str) -> str:
     """Stable identity of a story across runs: its URL, else its title and publication date."""
-    if url:
-        return url.split("#", 1)[0]
-    return f"{_norm_title(title)}|{published[:10]}"
+    url = url.split("#", 1)[0]
+    return url if url else f"{_norm_title(title)}|{published[:10]}"
 
 
 def news_records(sentiment, run_at: str) -> List[Dict[str, Any]]:
@@ -144,22 +165,30 @@ def news_records(sentiment, run_at: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _keys(path: str) -> Set[str]:
-    keys: Set[str] = set()
+def _version(rec: Dict[str, Any]) -> Tuple[Any, str]:
+    """A story as archived: its key and its normalized headline."""
+    return rec["key"], _norm_title(str(rec.get("title") or ""))
+
+
+def _keys(path: str) -> Set[Tuple[Any, str]]:
+    """The versions (key, headline) of every readable line of a month file."""
+    keys: Set[Tuple[Any, str]] = set()
     if not os.path.exists(path):
         return keys
-    with open(path, encoding="utf-8") as fh:
+    # errors="replace": a byte that is not UTF-8 (a write torn inside a character) spoils one line only
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
         for line in fh:
             try:
-                keys.add(json.loads(line)["key"])
+                keys.add(_version(json.loads(line)))
             except (ValueError, KeyError, TypeError):
-                continue      # tolerate a torn last line
+                continue      # tolerate a torn or damaged line
     return keys
 
 
 def append_news(root: str, records: Iterable[Dict[str, Any]], build: str = "", model_version: str = "") -> int:
-    """Append the stories not archived before. Stories are at most a week old when scored, so
-    checking this month's and last month's files is enough. Returns the number added."""
+    """Append the stories not archived before, and a new line when a story's headline changes.
+    Stories are at most a week old when scored, so checking this month's and last month's files is
+    enough. Returns the number added."""
     records = list(records)
     if not records:
         return 0
@@ -168,16 +197,26 @@ def append_news(root: str, records: Iterable[Dict[str, Any]], build: str = "", m
     previous = (seen_at.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     folder = os.path.join(root, "news")
     os.makedirs(folder, exist_ok=True)
-    seen = _keys(os.path.join(folder, f"{previous}.jsonl")) | _keys(os.path.join(folder, f"{month}.jsonl"))
-    added = 0
-    with open(os.path.join(folder, f"{month}.jsonl"), "a", encoding="utf-8") as fh:
-        for rec in records:
-            if rec["key"] in seen:
-                continue
-            seen.add(rec["key"])
-            fh.write(json.dumps({**rec, "build": build, "model_version": model_version}, ensure_ascii=False) + "\n")
-            added += 1
-    return added
+    path = os.path.join(folder, f"{month}.jsonl")
+    seen = _keys(os.path.join(folder, f"{previous}.jsonl")) | _keys(path)
+    lines = []
+    for rec in records:
+        version = _version(rec)
+        if version in seen:
+            continue
+        seen.add(version)
+        # ASCII JSON: a lone surrogate in a headline is stored as an escape instead of failing the write
+        lines.append(json.dumps({**rec, "build": build, "model_version": model_version}) + "\n")
+    if not lines:
+        return 0
+    with open(path, "a+b") as fh:
+        end = fh.seek(0, os.SEEK_END)
+        if end:
+            fh.seek(end - 1)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")      # end a torn last line, so it cannot swallow the first new record
+        fh.write("".join(lines).encode("utf-8"))
+    return len(lines)
 
 
 def archive_run(fc, root: str, prices: Optional[List[float]] = None) -> Dict[str, Any]:

@@ -59,10 +59,14 @@ def test_missed_run_is_reported_by_the_next_check():
     assert healthy(later, rows=rows) == ([], [])
 
 
-def test_monday_morning_only_checks_mondays_runs():
+def test_monday_morning_rechecks_friday_evening_only():
     mon = datetime(2026, 9, 28, 15, 5, tzinfo=UTC)
-    rows = rows_for([s for s in runs_until(mon) if s.day == 28], spot_date="2026-09-28")   # no Friday rows at all
-    assert healthy(mon, rows=rows) == ([], [])
+    fri = datetime(2026, 9, 25, tzinfo=UTC)
+    rows = rows_for([s for s in runs_until(mon) if s.day == 28 or s >= at(19, 40, fri)], spot_date="2026-09-28")
+    assert healthy(mon, rows=rows) == ([], [])       # Friday's earlier runs were judged on Friday
+    rows = rows_for([s for s in runs_until(mon) if s != at(21, 40, fri)], spot_date="2026-09-28")
+    problems, _ = healthy(mon, rows=rows)            # in case Friday's 22:15 check never ran
+    assert len(problems) == 1 and "2026-09-25 21:40 UTC" in problems[0]
 
 
 def test_a_run_still_in_progress_is_not_a_miss():
@@ -71,12 +75,24 @@ def test_a_run_still_in_progress_is_not_a_miss():
     assert healthy(now, rows=rows) == ([], [])
 
 
-def test_stale_live_price_only_matters_during_the_session():
+def test_live_loop_must_be_fresh_in_session_and_run_until_the_close():
     stale = {"asof": (at(12, 0)).isoformat()}
     problems, _ = healthy(at(15, 5), live=stale)
     assert len(problems) == 1 and "live.json" in problems[0]
-    assert healthy(at(22, 15), live=stale) == ([], [])
     assert "live.json" in healthy(at(17, 5), live=None)[0][0]
+    # after the close: a loop that stopped during the day is still reported
+    problems, _ = healthy(at(22, 15), live=stale)
+    assert len(problems) == 1 and "before the last session close (2026-09-29 20:00 UTC)" in problems[0]
+    assert healthy(at(22, 15), live={"asof": at(19, 59).isoformat()}) == ([], [])
+    assert healthy(at(22, 15), live=None) == ([], [])
+    sat = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)
+    rows = rows_for(runs_until(sat), spot_date="2026-10-02")
+    assert healthy(sat, rows=rows, live={"asof": "2026-10-02T19:59:10+00:00"}) == ([], [])
+    assert len(healthy(sat, rows=rows, live={"asof": "2026-10-02T18:00:00+00:00"})[0]) == 1
+    winter = datetime(2026, 12, 1, 22, 15, tzinfo=UTC)                  # the close is 21:00 UTC
+    rows = rows_for(runs_until(winter), spot_date="2026-12-01")
+    assert healthy(winter, rows=rows, live={"asof": "2026-12-01T20:59:00+00:00"}) == ([], [])
+    assert len(healthy(winter, rows=rows, live={"asof": "2026-12-01T20:40:00+00:00"})[0]) == 1
 
 
 def test_unfinished_run_and_stale_prices_and_down_page():

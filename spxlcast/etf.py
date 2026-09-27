@@ -77,9 +77,10 @@ def calibrate(etf_close: pd.Series, index_close: pd.Series, lookback: int,
     A plain OLS is dominated by a handful of days where the ETF's closing print sits away from its
     NAV (e.g. April 2025); those days drag beta down and inflate the tracking noise several-fold.
     Residuals beyond ``outlier_mads`` robust standard deviations are excluded and the fit repeated.
+    A zero or non-finite close is a missing day, not a -100% day followed by an infinite one.
     """
-    r_etf = etf_close.pct_change(fill_method=None)
-    r_idx = index_close.pct_change(fill_method=None)
+    r_etf = etf_close.where(np.isfinite(etf_close) & (etf_close > 0)).pct_change(fill_method=None)
+    r_idx = index_close.where(np.isfinite(index_close) & (index_close > 0)).pct_change(fill_method=None)
     df = pd.concat([r_etf.rename("etf"), r_idx.rename("idx")], axis=1).dropna().iloc[-lookback:]
     if len(df) < 60:
         return None
@@ -112,7 +113,7 @@ def expense_ratio_from_info(info: dict, default: float) -> tuple[float, str]:
             continue
         try:
             v = float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if not np.isfinite(v) or v <= 0:
             continue
@@ -134,7 +135,15 @@ def build_etf_params(snap: MarketSnapshot, cfg: Config, rf_short: float) -> ETFP
 
     leverage = cfg.leverage_target
     tracking = 0.0
-    if cal is not None:
+    if cal is not None and not (np.isfinite(cal.beta) and np.isfinite(cal.resid_sd_daily)
+                                and cal.r2 >= cfg.calibration_min_r2):
+        # A 3x fund tracks its index almost exactly, so a poor fit means bad or mixed-basis prices: its
+        # beta and noise must not drive the simulation (a run without a calibration is flagged).
+        notes.append(f"calibration rejected (beta {cal.beta:.3f}, R2 {cal.r2:.3f} < {cfg.calibration_min_r2:.2f}, "
+                     f"tracking noise {cal.resid_sd_daily:.3%}/day on {cal.n} days): check the price history; "
+                     f"using stated leverage and zero tracking noise")
+        cal = None
+    elif cal is not None:
         # Trust the stated leverage unless the realised beta is clearly different.
         if abs(cal.beta - cfg.leverage_target) < 0.25:
             leverage = cfg.leverage_target

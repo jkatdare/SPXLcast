@@ -57,6 +57,9 @@ def test_news_is_archived_once_across_runs_and_months(tmp_path):
     with open(tmp_path / "news" / "2026-10.jsonl", "a", encoding="utf-8") as fh:
         fh.write('{"key": "e", "tit')
     assert append_news(root, [rec("d", october), rec("f", october)]) == 1
+    last = (tmp_path / "news" / "2026-10.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    assert json.loads(last)["key"] == "f"                  # starts on its own line, readable
+    assert append_news(root, [rec("f", october)]) == 0
 
 
 def test_news_records_keep_text_score_and_relevance():

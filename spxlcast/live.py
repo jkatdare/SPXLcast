@@ -10,13 +10,17 @@ maximum. The rating is a function of returns only, so it is unchanged until the 
 
 Every minute during the session the loop fetches the latest quote, writes ``output/live.json``
 and appends one row to ``logs/spot_log.csv`` (a minute-by-minute price record for later
-backtests). Outside the session it idles.
+backtests). Outside the session it fetches nothing: it marks live.json closed after the bell and
+restates it once on each new full run (at that run's own spot, or at the last quote of the session
+when that is later), so the page always matches the latest report. ``spot_since`` records when the
+quote last moved, so the health check can tell a frozen feed from a live one.
 
     python -m spxlcast serve --root /data --live          # status page + minute loop
 """
 from __future__ import annotations
 
 import csv
+import io
 import json
 import logging
 import os
@@ -78,15 +82,31 @@ def _cdf(prices: List[float], pcts: List[float], x: float) -> float:
     return float(np.interp(x, prices, pcts))
 
 
-def reprice(base: Dict, spot: float, now: Optional[datetime] = None) -> Dict:
-    """Restate a stored forecast (``forecast_to_dict`` output) at a new spot price."""
+def _utc(stamp) -> Optional[datetime]:
+    try:
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _run_id(stamp) -> Optional[str]:
+    """A run's time the way the track record and the archive name it: '2026-09-22T21:40:21Z' (floored)."""
+    t = _utc(stamp)
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if t else stamp
+
+
+def reprice(base: Dict, spot: float, now: Optional[datetime] = None,
+            session_open: Optional[bool] = None) -> Dict:
+    """Restate a stored forecast (``forecast_to_dict`` output) at a new spot price, quoted at ``now``
+    (default: the clock). ``session_open`` defaults to the session state at ``now``."""
     base_spot = float(base["spot"])
     if not (np.isfinite(spot) and spot > 0 and np.isfinite(base_spot) and base_spot > 0):
         raise ValueError("spot and base spot must be positive finite prices")
     ratio = spot / base_spot
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     ny = pd.Timestamp(now_utc).tz_convert(NY_TZ)
-    _, is_open = session_state(ny)
+    is_open = session_state(ny)[1] if session_open is None else session_open
 
     levels: List[float] = sorted(float(p) for p in (base.get("price_lookup") or {}).keys())
     horizons: Dict[str, Dict] = {}
@@ -103,8 +123,10 @@ def reprice(base: Dict, spot: float, now: Optional[datetime] = None) -> Dict:
         if grid:
             pcts = list(grid["percentiles"])
             term = [v * ratio for v in grid["terminal"]]
-            lo = [v * ratio for v in grid["path_min"]]
-            hi = [v * ratio for v in grid["path_max"]]
+            # every path starts at the spot; clamping keeps that point mass exactly at the quote, which
+            # base_spot * ratio can miss by one ulp (a level at the quote must read 100% touched)
+            lo = [min(v * ratio, spot) for v in grid["path_min"]]
+            hi = [max(v * ratio, spot) for v in grid["path_max"]]
             out["price_lookup"] = [{
                 "price": p, "vs_spot": p / spot - 1.0,
                 "percentile": _cdf(term, pcts, p),
@@ -124,7 +146,7 @@ def reprice(base: Dict, spot: float, now: Optional[datetime] = None) -> Dict:
         "etf": base.get("etf"),
         "spot": float(spot),
         "base_spot": base_spot,
-        "base_run_at": base.get("run_at"),
+        "base_run_at": _run_id(base.get("run_at")),     # joins forecast_log.run_at as a string
         "base_spot_status": base.get("spot_status"),
         "change_vs_base": ratio - 1.0,
         "rating": {"label": r["label"], "conviction": r["conviction"], "score": r["score"],
@@ -150,27 +172,52 @@ def load_base(root: str) -> Optional[Dict]:
 def write_live(root: str, live: Dict) -> str:
     path = os.path.join(root, "output", "live.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(live, fh, indent=1, allow_nan=False)
-    os.replace(tmp, path)   # readers never see a half-written file
+    tmp = f"{path}.{os.urandom(6).hex()}.tmp"    # never shared: two loops overlap during a deploy
+    try:
+        with open(tmp, "x", encoding="utf-8") as fh:
+            json.dump(live, fh, indent=1, allow_nan=False)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)   # readers never see a half-written file
+                break
+            except PermissionError:     # Windows: a reader holds live.json open for a moment
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
 def append_spot_log(root: str, live: Dict) -> str:
     path = os.path.join(root, "logs", "spot_log.csv")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    new = not (os.path.exists(path) and os.path.getsize(path) > 0)
-    with open(path, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=SPOT_LOG_COLUMNS)
-        if new:
-            w.writeheader()
-        w.writerow({
-            "ts_utc": live["asof"], "ny_time": live["asof_ny"], "spot": f"{live['spot']:.4f}",
-            "session": "open" if live["session_open"] else "closed",
-            "base_run_at": live["base_run_at"], "base_spot": f"{live['base_spot']:.4f}",
-            "rating": live["rating"]["label"], "score": f"{live['rating']['score']:.4f}",
-        })
+    row = io.StringIO()
+    csv.DictWriter(row, fieldnames=SPOT_LOG_COLUMNS).writerow({
+        "ts_utc": live["asof"], "ny_time": live["asof_ny"], "spot": f"{live['spot']:.4f}",
+        "session": "open" if live["session_open"] else "closed",
+        "base_run_at": live["base_run_at"], "base_spot": f"{live['base_spot']:.4f}",
+        "rating": live["rating"]["label"], "score": f"{live['rating']['score']:.4f}",
+    })
+    with open(path, "ab") as fh:        # creates it when absent
+        pass
+    prefix = b""
+    if os.path.getsize(path) == 0:
+        # The header is written at offset 0, not appended: every loop that finds the file absent or
+        # emptied writes the same bytes to the same place, so loops starting together leave one header.
+        with open(path, "r+b") as fh:
+            fh.write((",".join(SPOT_LOG_COLUMNS) + "\r\n").encode("utf-8"))
+    else:
+        with open(path, "rb") as fh:    # a torn last row gets its line end, so the new row is not glued on
+            fh.seek(-1, os.SEEK_END)
+            last = fh.read(1)
+        prefix = b"" if last == b"\n" else b"\n" if last == b"\r" else b"\r\n"
+    with open(path, "ab") as fh:
+        fh.write(prefix + row.getvalue().encode("utf-8"))
     return path
 
 
@@ -183,30 +230,87 @@ def refresh_once(root: str, fetch: Callable[[str], Optional[float]] = fetch_spot
     spot = fetch(base.get("etf") or "SPXL")
     if spot is None:
         log.warning("no quote for %s this minute", base.get("etf"))
-        return None
+        cur = _load_live(root)
+        if cur is not None and _run_id(cur.get("base_run_at")) == _run_id(base.get("run_at")):
+            return None
+        # a full run landed during a quote outage: show it at its own price, not the last run's rating
+        live = reprice(base, float(base["spot"]), now=_utc(base.get("run_at")))
+        write_live(root, live)
+        return live
     live = reprice(base, spot, now=now)
-    write_live(root, live)
-    if log_row:
-        append_spot_log(root, live)
+    # asof is only when this tick wrote: a feed that keeps answering with an old price shows in spot_since
+    cur = _load_live(root)
+    same = cur is not None and cur.get("session_open") is True and cur.get("spot") == live["spot"]
+    since = (cur.get("spot_since") or cur.get("asof")) if same else None
+    live["spot_since"] = since if isinstance(since, str) else live["asof"]
+    try:
+        write_live(root, live)
+    finally:                            # the price record must not depend on the page file
+        if log_row:
+            append_spot_log(root, live)
     return live
 
 
+def _load_live(root: str) -> Optional[Dict]:
+    try:
+        with open(os.path.join(root, "output", "live.json"), encoding="utf-8") as fh:
+            cur = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        return None
+    return cur if isinstance(cur, dict) else None
+
+
+def settle_closed(root: str) -> Optional[Dict]:
+    """Outside the session: mark live.json closed at its last quote, or restate it at the spot and
+    time of a newer full run (at the loop's last quote when that is later than the run, as for a run
+    that started before the bell and finished after it). Fetches nothing and logs no spot_log row.
+    None when nothing changed."""
+    if not os.path.exists(os.path.join(root, "output", "forecast.json")):
+        return None                     # no run yet: nothing to show, and nothing to warn about every minute
+    base = load_base(root)
+    if base is None:
+        return None
+    cur = _load_live(root)
+    # both sides normalised: a live.json written before run ids were normalised still names this run
+    last = cur if cur is not None and _run_id(cur.get("base_run_at")) == _run_id(base.get("run_at")) else None
+    if last is not None and last.get("session_open") is False:
+        return None
+    run_at, cur_at = _utc(base.get("run_at")), _utc(cur.get("asof")) if cur is not None else None
+    if last is None and run_at and cur_at and cur_at > run_at:
+        last = cur                      # the previous run's last quote is later than this run's own price
+    try:
+        spot, at = float(last["spot"]), _utc(last["asof"])
+    except (KeyError, TypeError, ValueError):   # no quote on this run yet: its own spot, as of the run
+        spot, at = float(base["spot"]), run_at
+    live = reprice(base, spot, now=at, session_open=False)
+    write_live(root, live)
+    return live
+
+
+def _seconds_to_open(now: pd.Timestamp) -> float:
+    """Seconds from ``now`` (New York) to the next 9:30 ET, on any day."""
+    day = now.date() if (now.hour, now.minute) < (9, 30) else (now + pd.Timedelta(days=1)).date()
+    return (pd.Timestamp(f"{day} 09:30", tz=NY_TZ) - now).total_seconds()
+
+
 def run_loop(root: str, interval: float = 60.0, stop: Optional[threading.Event] = None,
-             fetch: Callable[[str], Optional[float]] = fetch_spot, idle_interval: float = 300.0) -> None:
-    """Tick every ``interval`` seconds while the regular session is open; idle otherwise."""
+             fetch: Callable[[str], Optional[float]] = fetch_spot, idle_interval: float = 60.0) -> None:
+    """Tick every ``interval`` seconds while the regular session is open; otherwise settle live.json
+    every ``idle_interval`` seconds and wake at the open."""
     stop = stop or threading.Event()
     log.info("live loop: every %.0fs during the session", interval)
     while not stop.is_set():
-        _, is_open = session_state(ny_now())
+        now = ny_now()
+        _, is_open = session_state(now)
         started = time.monotonic()
-        if is_open:
-            try:
+        try:
+            if is_open:
                 refresh_once(root, fetch=fetch)
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive whatever Yahoo returns
-                log.warning("live refresh failed: %s", exc)
-            wait = interval
-        else:
-            wait = idle_interval
+            else:
+                settle_closed(root)
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive whatever Yahoo returns
+            log.warning("live refresh failed: %s", exc)
+        wait = interval if is_open else min(idle_interval, _seconds_to_open(now) + 1.0)
         stop.wait(max(0.0, wait - (time.monotonic() - started)))
 
 

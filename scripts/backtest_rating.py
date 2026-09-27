@@ -3,12 +3,15 @@
 At each month-end the live model's own functions (expected_index_return, vol_term_structure,
 simulate, rate) are fed only what was known that day:
 
-* S&P 500 earnings and dividends from Shiller's data, lagged three months for publication, over
-  the S&P 500 close
+* S&P 500 trailing earnings and dividends from Shiller's data at the last quarter-end already
+  reported (two months after it ends), over the S&P 500 close. Shiller interpolates the months
+  between quarter-ends, so reading an in-between month would leak part of an unreported quarter.
 * expected inflation: the 10-year breakeven (FRED T10YIE) from 2003; before that, trailing 10-year
   CPI inflation (the proxy the drift backtest uses)
-* regime inputs from FRED: 3-month bill and 10-year yields (curve), high-yield spread (from 1997),
-  CPI and unemployment (only months already released)
+* regime inputs from FRED: 3-month bill and 10-year yields (curve), CPI and unemployment (only
+  months already released; CPI YoY and the Sahm gap by the live model's own functions), and the
+  high-yield spread, which FRED serves for the last three years only: the credit-stress penalty
+  cannot fire before then, and the report says for how many month-ends
 * VIX, VIX3M and VIX6M from Yahoo. VIX3M/VIX6M start in 2008; before that they are imputed from the
   VIX with a log-linear fit on 2008-2026, the only use of later data (``--term-structure flat``
   uses the live model's own fallback instead: a flat curve at the VIX)
@@ -19,7 +22,8 @@ of the borrowed 2x at the 3-month bill plus the spread), checked against SPXL wh
 
 Reported:
 1. Does the rating carry information? Forward 6-month SPXL returns by label and by score quintile,
-   and the rank correlation of score with forward return, with overlap-aware 90% intervals.
+   and the rank correlation of score with forward return, with overlap-aware 90% intervals
+   (closed form on the number of independent outcome windows, as the live scorer's).
 2. Where do the thresholds belong? BUY/SELL threshold sweep, full sample and both halves.
 3. What following the rating would have done (illustration only): monthly rules vs buy-and-hold.
 4. Calibration of the full model at 1W to 6M: PIT, band coverage, 20% drawdown odds.
@@ -51,10 +55,11 @@ from backtest_drift import load_shiller                                         
 from spxlcast.config import Config                                             # noqa: E402
 from spxlcast.data import MarketSnapshot, _fred_api                            # noqa: E402
 from spxlcast.env import fred_api_key                                          # noqa: E402
-from spxlcast.evaluation import (block_bootstrap, crps_normal, crps_sample, effective_n,  # noqa: E402
-                                 naive_leveraged_lognormal, spearman)
-from spxlcast.fundamentals import (IndexFundamentals, MacroState, expected_index_return,  # noqa: E402
-                                   vol_term_structure)
+from spxlcast.evaluation import (crps_normal, crps_sample, effective_n, mean_interval,  # noqa: E402
+                                 naive_leveraged_lognormal, proportion_interval, skill_interval,
+                                 spearman)
+from spxlcast.fundamentals import (IndexFundamentals, MacroState, _calendar_months, cpi_yoy_from,  # noqa: E402
+                                   expected_index_return, sahm_gap_from, vol_term_structure)
 from spxlcast.montecarlo import simulate                                       # noqa: E402
 from spxlcast.rating import rate                                               # noqa: E402
 
@@ -62,7 +67,7 @@ HORIZONS = [5, 10, 21, 63, 126]
 RATING_H = 126
 YAHOO = ["^SP500TR", "^GSPC", "^VIX", "^VIX3M", "^VIX6M", "SPXL"]
 FRED = ["DGS3MO", "DGS10", "T10YIE", "BAMLH0A0HYM2", "CPIAUCSL", "UNRATE"]
-EARNINGS_LAG_MONTHS = 3          # S&P reports a quarter's earnings about two months after it ends
+EARNINGS_LAG_MONTHS = 2          # S&P reports a quarter's earnings about two months after it ends
 SPXL_FROM = pd.Timestamp("2009-01-01")   # SPXL launched Nov 2008; synthetic fund before this
 TRACKING_SD = 0.0008             # daily tracking noise, as calibrated on SPXL vs SPY
 CONSTANT_DRIFT = 0.07
@@ -91,10 +96,7 @@ def load_inputs(out_dir: Path, refresh: bool) -> Dict:
         if s is None:
             raise SystemExit(f"FRED returned nothing for {sid}")
         fred[sid] = s
-    shiller_path = out_dir / "ie_data.xls"
-    if refresh and shiller_path.exists():
-        shiller_path.unlink()
-    data = {"closes": closes, "fred": fred, "shiller": load_shiller(shiller_path),
+    data = {"closes": closes, "fred": fred, "shiller": load_shiller(out_dir / "ie_data.xls", refresh),
             "fetched": datetime.now(timezone.utc).isoformat()}
     pd.to_pickle(data, cache)
     return data
@@ -171,22 +173,32 @@ def released(series: pd.Series, origin: pd.Timestamp) -> pd.Series:
     return series[series.index <= cutoff].dropna()
 
 
+def reported_quarter(origin: pd.Timestamp) -> pd.Timestamp:
+    """The month of the last quarter-end whose earnings are out at a month-end origin."""
+    m = origin.to_period("M") - EARNINGS_LAG_MONTHS
+    return (m - m.month % 3).to_timestamp()
+
+
 def inputs_at(d: pd.DataFrame, pos: int, inputs: Dict, cfg: Config, ts_mode: str, fits: Dict) -> Optional[Dict]:
     row = d.iloc[pos]
     origin = d.index[pos]
     sh = inputs["shiller"]
-    e_month = (origin.to_period("M") - EARNINGS_LAG_MONTHS).to_timestamp()
-    if e_month not in sh.index or not np.isfinite(row["vix"]) or not np.isfinite(row["rf"]):
+    q = reported_quarter(origin)
+    if q not in sh.index or not np.isfinite(row["vix"]) or not np.isfinite(row["rf"]):
         return None
-    E, D, P = float(sh.at[e_month, "E"]), float(sh.at[e_month, "D"]), float(row["gspc"])
+    E, D, P = float(sh.at[q, "E"]), float(sh.at[q, "D"]), float(row["gspc"])
     cpi = released(inputs["fred"]["CPIAUCSL"], origin)
     un = released(inputs["fred"]["UNRATE"], origin)
-    if len(cpi) < 121 or len(un) < 15:
-        return None
-    trailing_infl = float((cpi.iloc[-1] / cpi.iloc[-121]) ** 0.1 - 1.0)
     bei = row["bei"] if np.isfinite(row["bei"]) else None
-    infl = bei if bei is not None else trailing_infl
-    roll = un.rolling(3).mean()
+    if len(un) < 15:
+        return None
+    infl = bei
+    if bei is None:     # before the breakeven series: trailing 10-year CPI, by calendar month as for the YoY
+        months = _calendar_months(cpi)
+        base = months.get(months.index[-1] - 120) if months is not None else None
+        if base is None or not np.isfinite(base):
+            return None
+        infl = float((months.iloc[-1] / base) ** 0.1 - 1.0)
 
     vix3m = row["vix3m"] if np.isfinite(row["vix3m"]) else None
     vix6m = row["vix6m"] if np.isfinite(row["vix6m"]) else None
@@ -202,8 +214,8 @@ def inputs_at(d: pd.DataFrame, pos: int, inputs: Dict, cfg: Config, ts_mode: str
         rf_3m=float(row["rf"]), y2=None, y5=None, y10=float(row["y10"]), y30=None,
         curve_10y_3m=float(row["y10"] - row["rf"]), breakeven_10y=infl, real_10y=None, sofr=None,
         hy_oas=float(row["hy"]) if np.isfinite(row["hy"]) else None,
-        unemployment=float(un.iloc[-1]) / 100.0, unemployment_sahm_gap=float(roll.iloc[-1] - roll.iloc[-13:-1].min()),
-        cpi_yoy=float(cpi.iloc[-1] / cpi.iloc[-13] - 1.0), vix=float(row["vix"]), vix3m=vix3m, vix6m=vix6m,
+        unemployment=float(un.iloc[-1]) / 100.0, unemployment_sahm_gap=sahm_gap_from(un),
+        cpi_yoy=cpi_yoy_from(cpi), vix=float(row["vix"]), vix3m=vix3m, vix6m=vix6m,
         vvix=None, skew=None, dxy=None, oil=None, gold=None)
     fund = IndexFundamentals(index_level=P, trailing_pe=P / E, earnings_yield=E / P, dividend_yield=D / P,
                              eps_growth=cfg.long_run_real_eps_growth + infl, book_to_price=None, sales_to_price=None)
@@ -270,30 +282,45 @@ def _ci(lo: float, hi: float, fmt: str = "{:+.1%}") -> str:
     return f"[{fmt.format(lo)}, {fmt.format(hi)}]"
 
 
-def _group_diff(label: str):
-    def stat(a: np.ndarray) -> float:
-        is_l = a[:, 0] > 0.5
-        if is_l.sum() == 0 or (~is_l).sum() == 0:
-            return float("nan")
-        return float(a[is_l, 1].mean() - a[~is_l, 1].mean())
-    return stat
+def _diff_ci(y: pd.Series, sel: pd.Series, pos: pd.Series, h: int) -> tuple:
+    """90% interval for mean(y where sel) - mean(y elsewhere): the t interval of ``mean_interval`` on
+    the difference's influence values (Welch's variance with the whole sample's independent-window
+    count, which stays conservative when the selected months cluster). n/a unless each group spans
+    at least three independent windows: with two, the spread rests on two episodes and the interval
+    covers only about 82%."""
+    if min(effective_n(pos[sel], h), effective_n(pos[~sel], h)) < 3:
+        return float("nan"), float("nan")
+    p = float(sel.mean())
+    m1, m0 = y[sel].mean(), y[~sel].mean()
+    psi = np.where(sel, (y - m1) / p, -(y - m0) / (1.0 - p))
+    lo, hi = mean_interval(psi, effective_n(pos, h))
+    return m1 - m0 + lo, m1 - m0 + hi
+
+
+def _corr_ci(r: float, n_eff: float, alpha: float = 0.10) -> tuple:
+    """Fisher-z interval for a Spearman correlation on n_eff independent pairs, with Bonett and
+    Wright's variance (1 + r^2 / 2) / (n - 3)."""
+    from scipy.stats import norm
+    if not (n_eff > 4 and abs(r) < 1):
+        return float("nan"), float("nan")
+    half = float(norm.ppf(1.0 - alpha / 2.0)) * math.sqrt((1.0 + r * r / 2.0) / (n_eff - 3.0))
+    return math.tanh(math.atanh(r) - half), math.tanh(math.atanh(r) + half)
 
 
 def rating_section(o: pd.DataFrame) -> List[str]:
     out = []
     h = RATING_H
     ev = o.dropna(subset=[f"excess_{h}"])
-    block = math.ceil(h / 21)
+    n_eff = effective_n(ev["pos"], h)
     out.append(f"Forward 6-month SPXL return by the rating given ({len(ev)} month-ends with a full 6 months after; "
-               f"consecutive windows overlap, about {effective_n(ev['pos'], h):.0f} independent)")
+               f"consecutive windows overlap, about {n_eff:.0f} independent)")
     rows = []
     for lab in LABELS:
         g = ev[ev["label"] == lab]
         if len(g) == 0:
             rows.append({"rating": lab, "months": 0, "share": "0%"})
             continue
-        diff_lo, diff_hi = block_bootstrap(np.column_stack([(ev["label"] == lab).astype(float), ev[f"excess_{h}"]]),
-                                           block, _group_diff(lab))
+        diff_lo, diff_hi = _diff_ci(ev[f"excess_{h}"], ev["label"] == lab, ev["pos"], h)
         rows.append({"rating": lab, "months": len(g), "share": f"{len(g) / len(ev):.0%}",
                      "SPXL mean": f"{g[f'ret_{h}'].mean():+.1%}", "SPXL median": f"{g[f'ret_{h}'].median():+.1%}",
                      "excess vs T-bill": f"{g[f'excess_{h}'].mean():+.1%}",
@@ -308,16 +335,21 @@ def rating_section(o: pd.DataFrame) -> List[str]:
     rows = []
     for hh in (21, 63, 126):
         e = o.dropna(subset=[f"excess_{hh}"])
-        a = np.column_stack([e["score"], e[f"excess_{hh}"]])
-        lo, hi = block_bootstrap(a, math.ceil(hh / 21), spearman)
-        a7 = np.column_stack([e["score_const7"], e[f"excess_{hh}"]])
-        rows.append({"horizon": f"{hh // 21}M", "n": len(e), "independent": f"{effective_n(e['pos'], hh):.0f}",
-                     "model score": f"{spearman(a):+.2f} {_ci(lo, hi, '{:+.2f}')}",
-                     "score with constant 7% drift": f"{spearman(a7):+.2f}"})
+        r, ne = spearman(e["score"].values, e[f"excess_{hh}"].values), effective_n(e["pos"], hh)
+        rows.append({"horizon": f"{hh // 21}M", "n": len(e), "independent": f"{ne:.0f}",
+                     "model score": f"{r:+.2f} {_ci(*_corr_ci(r, ne), '{:+.2f}')}",
+                     "score with constant 7% drift": f"{spearman(e['score_const7'].values, e[f'excess_{hh}'].values):+.2f}"})
     out.append(pd.DataFrame(rows).to_string(index=False))
 
+    if len(ev) < 5:
+        return out
     out.append("\nForward 6-month SPXL excess return by score quintile")
-    q = pd.qcut(ev["score"], 5, labels=["Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"])
+    # ranked first, so scores tied at the +1.00 cap cannot collapse two quintile edges into one
+    q = pd.qcut(ev["score"].rank(method="first"), 5, labels=["Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"])
+    split = [s for s, k in q.groupby(ev["score"]).nunique().items() if k > 1]
+    if split:
+        out.append(f"(months tied at a score of {', '.join(f'{s:+.2f}' for s in split)} are split between "
+                   f"quintiles in date order)")
     t = ev.groupby(q, observed=True).agg(months=("score", "size"), score_from=("score", "min"), score_to=("score", "max"),
                                          mean_excess=(f"excess_{h}", "mean"),
                                          p_beat_tbill=(f"excess_{h}", lambda s: (s > 0).mean()))
@@ -383,16 +415,21 @@ def strategy_section(o: pd.DataFrame, d: pd.DataFrame) -> List[str]:
             f"SPXL before 2009 is the synthetic fund)", pd.DataFrame(rows).to_string(index=False)]
 
 
+NO_OUTCOMES = "  (no month-end has an outcome at any horizon yet)"
+
+
 def calibration_section(o: pd.DataFrame) -> List[str]:
     out = ["Calibration of the full model (targets: mean PIT 0.50, 90% band 90%, 50% band 50%) [90% CI, overlap-aware]"]
     rows = []
     for h in HORIZONS:
+        if f"pit_{h}" not in o:
+            continue
         e = o.dropna(subset=[f"pit_{h}"])
-        block = max(1, math.ceil(h / 21))
-        pit_ci = block_bootstrap(e[f"pit_{h}"].values, block)
-        c90_ci = block_bootstrap(e[f"in90_{h}"].astype(float).values, block)
+        n_eff = effective_n(e["pos"], h)
+        pit_ci = mean_interval(e[f"pit_{h}"].values, n_eff)
+        c90_ci = proportion_interval(e[f"in90_{h}"].astype(float).mean(), n_eff)
         rec = {"horizon": {5: "1W", 10: "2W", 21: "1M", 63: "3M", 126: "6M"}[h], "n": len(e),
-               "independent": f"{effective_n(e['pos'], h):.0f}",
+               "independent": f"{n_eff:.0f}",
                "mean PIT": f"{e[f'pit_{h}'].mean():.2f} {_ci(*pit_ci, '{:.2f}')}",
                "in 90% band": f"{e[f'in90_{h}'].mean():.0%} {_ci(*c90_ci, '{:.0%}')}",
                "in 50% band": f"{e[f'in50_{h}'].mean():.0%}",
@@ -400,7 +437,7 @@ def calibration_section(o: pd.DataFrame) -> List[str]:
         if h >= 21:
             rec["P(-20% dip) pred/real"] = f"{e[f'pred_dd20_{h}'].mean():.0%} / {e[f'real_dd20_{h}'].mean():.0%}"
         rows.append(rec)
-    out.append(pd.DataFrame(rows).fillna("").to_string(index=False))
+    out.append(pd.DataFrame(rows).fillna("").to_string(index=False) if rows else NO_OUTCOMES)
     return out
 
 
@@ -409,18 +446,20 @@ def skill_section(o: pd.DataFrame) -> List[str]:
            "positive = the model is better [90% CI]"]
     rows = []
     for h in HORIZONS:
+        if f"crps_model_{h}" not in o:
+            continue
         e = o.dropna(subset=[f"crps_model_{h}"])
-        block = max(1, math.ceil(h / 21))
+        n_eff = effective_n(e["pos"], h)
         rec = {"horizon": {5: "1W", 10: "2W", 21: "1M", 63: "3M", 126: "6M"}[h], "n": len(e),
                "CRPS model": f"{e[f'crps_model_{h}'].mean():.4f}"}
         for bench, label in (("naive", "vs naive lognormal"), ("const7", "vs constant 7% drift")):
-            a = np.column_stack([e[f"crps_model_{h}"], e[f"crps_{bench}_{h}"]])
-            sk = 1.0 - a[:, 0].mean() / a[:, 1].mean()
-            lo, hi = block_bootstrap(a, block, lambda x: 1.0 - x[:, 0].mean() / x[:, 1].mean())
-            rec[label] = f"{sk:+.1%} {_ci(lo, hi)}"
+            sk = 1.0 - e[f"crps_model_{h}"].mean() / e[f"crps_{bench}_{h}"].mean()
+            rec[label] = f"{sk:+.1%} {_ci(*skill_interval(e[f'crps_model_{h}'], e[f'crps_{bench}_{h}'], n_eff))}"
         rows.append(rec)
-    out.append(pd.DataFrame(rows).to_string(index=False))
+    out.append(pd.DataFrame(rows).to_string(index=False) if rows else NO_OUTCOMES)
     for era, sel in (("1990-2007", o["date"] < "2008-01-01"), ("2008-2026", o["date"] >= "2008-01-01")):
+        if f"crps_model_{RATING_H}" not in o:
+            break
         e = o[sel].dropna(subset=[f"crps_model_{RATING_H}"])
         if len(e):
             out.append(f"  6M skill {era}: vs naive {1 - e[f'crps_model_{RATING_H}'].mean() / e[f'crps_naive_{RATING_H}'].mean():+.1%}, "
@@ -442,8 +481,9 @@ def plot(o: pd.DataFrame, cfg: Config, path: Path) -> None:
     ax1.set_ylabel("rating score")
     ax1.legend(loc="lower left", fontsize=8)
     ax1.set_title("SPXLcast rating at each month-end (dotted: BUY / SELL thresholds)")
-    e = o.dropna(subset=[f"excess_{RATING_H}"])
-    ax2.bar(e["date"], e[f"excess_{RATING_H}"], width=25, color=[colors[x] for x in e["label"]])
+    if f"excess_{RATING_H}" in o:
+        e = o.dropna(subset=[f"excess_{RATING_H}"])
+        ax2.bar(e["date"], e[f"excess_{RATING_H}"], width=25, color=[colors[x] for x in e["label"]])
     ax2.axhline(0, color="#333", lw=0.6)
     ax2.set_ylabel("SPXL return over the next 6 months\nminus T-bills")
     ax2.set_title("What happened next, coloured by the rating given (green BUY, amber HOLD, red SELL)")
@@ -462,22 +502,44 @@ def run(args) -> None:
     fits = fit_term_structure(d)
     val = validate_synthetic(d)
     positions = month_end_positions(d.index, args.start)
+    if not positions:
+        raise SystemExit(f"no complete month-end on or after --start {args.start}")
     print(f"{len(positions)} month-ends {d.index[positions[0]].date()} .. {d.index[positions[-1]].date()}, "
           f"{args.paths} paths, term structure before 2008: {args.term_structure}", flush=True)
-    rows, t0 = [], time.time()
+    rows, skipped, t0 = [], [], time.time()
     for i, pos in enumerate(positions):
         inp = inputs_at(d, pos, inputs, cfg, args.term_structure, fits)
         if inp is None:
+            skipped.append(d.index[pos])
             continue
         rows.append(run_origin(d, pos, inp, cfg))
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{len(positions)} ({time.time() - t0:.0f}s)", flush=True)
+    if not rows:
+        raise SystemExit("no month-end had the inputs the model needs")
     o = pd.DataFrame(rows)
     o.to_csv(out_dir / "rating_backtest.csv", index=False)
 
+    # inputs the backtest had to do without, in the report and on stderr
+    gaps = []
+    if skipped:
+        gaps.append(f"Skipped {len(skipped)} month-ends without the model's inputs ({skipped[0]:%Y-%m} .. "
+                    f"{skipped[-1]:%Y-%m}); Shiller earnings end {inputs['shiller'].index[-1]:%Y-%m}")
+    n_hy = int(o["hy_oas"].isna().sum())
+    if n_hy:
+        gaps.append(f"High-yield spread (FRED BAMLH0A0HYM2) only from {inputs['fred']['BAMLH0A0HYM2'].index.min():%Y-%m} "
+                    f"(FRED keeps three years of the ICE BofA data): the credit-stress penalty cannot fire at {n_hy} of "
+                    f"{len(o)} month-ends")
+    for sid, s in inputs["fred"].items():     # the breakeven's start is in the header; the spread's is above
+        if sid not in ("T10YIE", "BAMLH0A0HYM2") and s.index.min() > o["date"].iloc[0] + pd.DateOffset(years=1):
+            gaps.append(f"FRED {sid} starts {s.index.min():%Y-%m}, after the first month-end")
+    for g in gaps:
+        print(f"WARNING: {g}", file=sys.stderr)
     lines = [f"SPXLcast rating backtest, run {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC",
              f"{len(o)} month-ends {o['date'].iloc[0]:%Y-%m} .. {o['date'].iloc[-1]:%Y-%m}; {args.paths} paths per "
-             f"simulation; earnings lagged {EARNINGS_LAG_MONTHS} months; inflation: breakeven from 2003, trailing CPI before",
+             f"simulation; earnings of the last quarter reported ({EARNINGS_LAG_MONTHS} months after its end); "
+             f"inflation: breakeven from 2003, trailing CPI before",
+             *gaps,
              f"VIX term structure before 2008: {args.term_structure}"
              + (f" (log fit on {fits['vix6m'][3]} days: R2 {fits['vix3m'][2]:.2f} for VIX3M, {fits['vix6m'][2]:.2f} for VIX6M)"
                 if args.term_structure == "impute" else ""),
@@ -486,10 +548,16 @@ def run(args) -> None:
              f"tracking {val['tracking_sd_annual']:.1%}/yr",
              f"Labels given: " + ", ".join(f"{lab} {(o['label'] == lab).mean():.0%}" for lab in LABELS)
              + f"; with a constant 7% drift: " + ", ".join(f"{lab} {(o['label_const7'] == lab).mean():.0%}" for lab in LABELS),
+             "Intervals: 90%, closed form on the number of independent outcome windows (t for means, Wilson for "
+             "band hits, a t interval on the difference for skill and for rating differences, Fisher z for rank correlations)",
              ""]
-    for section in (rating_section(o), [""], threshold_section(o), [""], strategy_section(o, d), [""],
-                    calibration_section(o), [""], skill_section(o)):
-        lines.extend(section)
+    if f"excess_{RATING_H}" in o and o[f"excess_{RATING_H}"].notna().any():
+        lines += rating_section(o) + [""] + threshold_section(o) + [""]
+    else:
+        lines += ["No month-end has a full 6-month outcome yet: rating and threshold sections skipped", ""]
+    if len(o) > 1:
+        lines += strategy_section(o, d) + [""]
+    lines += calibration_section(o) + [""] + skill_section(o)
     report = "\n".join(lines)
     (out_dir / "rating_backtest.txt").write_text(report + "\n", encoding="utf-8")
     plot(o, cfg, out_dir / "rating_backtest.png")

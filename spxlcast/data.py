@@ -19,10 +19,13 @@ import requests
 import yfinance as yf
 
 from .cache import Cache
-from .config import FRED_SERIES, MARKET_TICKERS, Config
+from .config import FRED_SERIES, MARKET_TICKERS, Config, nyse_session
 from .env import fred_api_key
 
 log = logging.getLogger(__name__)
+# FRED takes its key only in the query string, and urllib3 puts the full URL in its log lines: every
+# request at DEBUG (-v), and a response header it cannot parse at WARNING (the CLI's default level).
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 NY_TZ = "America/New_York"
 
 
@@ -143,10 +146,11 @@ def ny_now() -> pd.Timestamp:
 
 
 def session_state(now: Optional[pd.Timestamp] = None) -> Tuple[str, bool]:
-    """(New York date, is the regular session open right now)."""
+    """(New York date, is the regular session open right now). NYSE holidays are closed all day and
+    early-close days close at 13:00."""
     now = now if now is not None else ny_now()
-    t = now.time()
-    is_open = now.weekday() < 5 and (t.hour, t.minute) >= (9, 30) and t.hour < 16
+    hours = nyse_session(now.date())
+    is_open = hours is not None and hours[0] <= now.time() < hours[1]
     return str(now.date()), is_open
 
 
@@ -162,13 +166,65 @@ def _tidy_history(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["Close"]) if "Close" in df else df
 
 
+# Yields and futures can print at or below zero (a bill yield at 0, WTI in April 2020); every other
+# series, index levels such as ^VIX included, cannot.
+_SIGNED_TICKERS = frozenset({"^IRX", "^FVX", "^TNX", "^TYX"})
+
+
+def _bad_close(ticker: str, close: pd.Series) -> pd.Series:
+    """Unusable closes: not finite, or not positive where a price cannot be."""
+    bad = ~np.isfinite(close.astype(float))
+    if not (ticker in _SIGNED_TICKERS or "=" in ticker):
+        bad |= close <= 0
+    return bad
+
+
+def _merge_archive(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """The fresh download wins on every date it covers; archived dates it lacks are kept. Yahoo
+    rescales auto-adjusted history at each dividend or split, so archived rows older than the
+    download are put on its basis when its first overlapping closes agree on one ratio (a single
+    corrected print, or a partial response, is not a basis change). An archived row inside the
+    download (a session Yahoo left out) takes the ratio of the closes on either side of it; when
+    those differ (an ex-date or a corrected print next to it) its basis is unknown and it is dropped."""
+    if new.empty:
+        return old
+    older = old[old.index < new.index[0]]
+    gaps = old[(old.index >= new.index[0]) & ~old.index.isin(new.index)]
+    cols = [c for c in ("Open", "High", "Low", "Close") if c in old]
+    common = new.index.intersection(old.index)[:5]
+    if len(older) and len(common) == 5 and "Close" in new and "Close" in old:
+        ratio = (new.loc[common, "Close"] / old.loc[common, "Close"]).to_numpy(dtype=float)
+        r = float(np.median(ratio))
+        if np.isfinite(r) and r > 0 and abs(r - 1.0) > 1e-5 and np.all(np.abs(ratio / r - 1.0) < 1e-5):
+            older = older.copy()
+            older[cols] = older[cols] * r
+    if len(gaps) and "Close" in new and "Close" in old:
+        both = new.index.intersection(old.index)
+        r = (new.loc[both, "Close"] / old.loc[both, "Close"]).astype(float)
+        around = r.reindex(r.index.union(gaps.index))
+        before, after = around.ffill().reindex(gaps.index), around.bfill().reindex(gaps.index)
+        inside = before.notna() & after.notna()
+        # 1e-4: Yahoo's re-served closes jitter by up to about 1e-5, and a real distribution is larger
+        agree = inside & ((after / before - 1.0).abs() < 1e-4)
+        f = after.where(agree & ((after - 1.0).abs() > 1e-4), 1.0)
+        keep = agree | ~inside
+        gaps = gaps[keep].copy()
+        gaps[cols] = gaps[cols].mul(f[keep], axis=0)
+    return pd.concat([f for f in (older, gaps, new) if len(f)]).sort_index()
+
+
 def fetch_prices(tickers: List[str], period: str, cache: Cache, ttl_hours: float,
                  required: Tuple[str, ...] = ()) -> Tuple[Dict[str, pd.DataFrame], Optional[float]]:
     """Download histories. The cache key carries the NY session date and open/closed state so a
     price fetched during the session is never served as the close after the bell. Returns the
     data and the Unix time it was fetched (cache mtime)."""
-    ny_date, is_open = session_state()
-    key = f"prices:{period}:{','.join(sorted(tickers))}:{ny_date}:{'open' if is_open else 'closed'}"
+    now = ny_now()
+    ny_date, is_open = session_state(now)
+    hours = nyse_session(now.date())
+    # before the open and after the close are told apart: on an early-close day the first run after
+    # 13:00 is within the TTL of the pre-open download, which lacks that day's close
+    phase = "open" if is_open else "pre" if hours is not None and now.time() < hours[0] else "closed"
+    key = f"prices:{period}:{','.join(sorted(tickers))}:{ny_date}:{phase}"
 
     def _download() -> Optional[Dict[str, pd.DataFrame]]:
         out: Dict[str, pd.DataFrame] = {}
@@ -206,19 +262,44 @@ def fetch_prices(tickers: List[str], period: str, cache: Cache, ttl_hours: float
     data = cache.get_or_fetch(key, ttl_hours, _download) or {}
     # Yahoo intermittently returns only the latest bar for some indices (^VIX3M, ^VIX6M). Keep a
     # per-ticker archive that accumulates every row ever seen so a partial response never erases
-    # history; the archive is refreshed with new rows and served back merged.
+    # history; the archive is refreshed with new rows and served back merged. --refresh bypasses
+    # only the download cache, never the archive.
+    archive = Cache(cache.directory, enabled=cache.enabled)
+    today = pd.Timestamp(ny_date)
     for t, df in list(data.items()):
         akey = f"archive:{t}:{period}"
-        old = cache.get(akey, ttl_hours=10 ** 6)
-        merged = df if old is None else pd.concat([old, df]).sort_index()
-        merged = merged[~merged.index.duplicated(keep="last")]
-        if old is None or len(merged) != len(old) or not merged.index[-1] == old.index[-1]:
-            cache.put(akey, merged)
+        old = archive.get(akey, ttl_hours=10 ** 6)
+        merged = df if old is None else _merge_archive(old, df)
+        if "Close" in merged:
+            merged = merged[~_bad_close(t, merged["Close"])]
+        if merged.empty:
+            del data[t]
+            continue
+        # Today's bar is a partial while the session is open: archiving it would serve it later as
+        # that session's close.
+        keep = merged[merged.index < today] if is_open else merged
+        if old is None or not keep.equals(old):
+            archive.put(akey, keep)
         data[t] = merged
     return data, cache.mtime(key)
 
 
+# Info fields the model and report read as numbers. Yahoo can send them as strings ('Infinity').
+_NUMERIC_INFO = ("trailingPE", "forwardPE", "yield", "dividendYield",
+                 "netExpenseRatio", "annualReportExpenseRatio", "expenseRatio")
+
+
+def _finite(v) -> Optional[float]:
+    """A value as a finite float, or None: Yahoo can send numbers as strings such as 'Infinity'."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if np.isfinite(f) else None
+
+
 def fetch_info(ticker: str, cache: Cache, ttl_hours: float) -> dict:
+    """Yahoo's info dict, with the numeric fields as finite floats (a value that is not one is dropped)."""
     def _fetch() -> dict:
         try:
             info = yf.Ticker(ticker).info or {}
@@ -227,7 +308,15 @@ def fetch_info(ticker: str, cache: Cache, ttl_hours: float) -> dict:
             info = {}
         return dict(info)
 
-    return cache.get_or_fetch(f"info:{ticker}", ttl_hours, _fetch) or {}
+    info = dict(cache.get_or_fetch(f"info:{ticker}", ttl_hours, _fetch) or {})
+    for k in _NUMERIC_INFO:
+        if k in info:
+            v = _finite(info[k])
+            if v is None:
+                del info[k]
+            else:
+                info[k] = v
+    return info
 
 
 def fetch_infos(tickers: List[str], cache: Cache, ttl_hours: float, workers: int = 4) -> Dict[str, dict]:
@@ -345,12 +434,19 @@ def fetch_news(tickers: List[str], cache: Cache, ttl_hours: float, workers: int 
 def _fred_api(series_id: str, timeout: float, api_key: str, years: int = 6) -> Optional[pd.Series]:
     """Official FRED API (needs a free key). Missing observations are reported as '.'."""
     start = (datetime.now(timezone.utc) - pd.Timedelta(days=365 * years)).strftime("%Y-%m-%d")
-    resp = requests.get(
-        "https://api.stlouisfed.org/fred/series/observations",
-        params={"series_id": series_id, "api_key": api_key, "file_type": "json", "observation_start": start},
-        timeout=timeout, headers={"User-Agent": "Mozilla/5.0 spxlcast"},
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={"series_id": series_id, "api_key": api_key, "file_type": "json", "observation_start": start},
+            timeout=timeout, headers={"User-Agent": "Mozilla/5.0 spxlcast"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        # requests puts the full URL, key included, in its messages: report the failure without it,
+        # and without chaining the original exception into a traceback.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise RuntimeError(f"FRED {series_id} request failed: {type(exc).__name__}"
+                           + (f" (HTTP {status})" if status else "")) from None
     obs = resp.json().get("observations", [])
     if not obs:
         return None

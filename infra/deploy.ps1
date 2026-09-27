@@ -43,8 +43,16 @@ function Exists {
     # Does the resource exist? (always "no" in dry-run mode, so the create path is shown)
     $azArgs = @($args)
     if ($DryRun) { return $false }
-    az @azArgs -o none 2>$null | Out-Null
+    # Function scope: under "Stop", Windows PowerShell 5.1 turns az's "not found" on stderr into a terminating error.
+    $ErrorActionPreference = "Continue"
+    $null = az @azArgs -o none 2>&1
     return ($LASTEXITCODE -eq 0)
+}
+function GitOut {
+    # git output, or nothing when git fails (same stderr caveat as Exists)
+    $ErrorActionPreference = "Continue"
+    $out = git @args 2>$null
+    if ($LASTEXITCODE -eq 0) { return $out }
 }
 
 # ---- FRED key from .env (never stored in the repo) ----------------------------------------
@@ -69,7 +77,15 @@ Write-Host "`n== 2. container registry and cloud image build (no local Docker ne
 Run provider register -n Microsoft.ContainerRegistry --wait -o none
 Run acr create -n $acr -g $ResourceGroup --sku Basic --admin-enabled true -o none
 $build = "unknown"   # the git commit, logged with every forecast
-try { $sha = git rev-parse HEAD; if ($LASTEXITCODE -eq 0 -and $sha) { $build = "$sha".Trim() } } catch { }
+$sha = GitOut rev-parse --short=12 HEAD
+if ($sha) {
+    $build = "$sha".Trim()
+    # acr build uploads the working tree, so uncommitted or untracked code must not ship under a clean id.
+    # The build column keeps 12 characters: shorten the sha so "-dirty" survives.
+    if (GitOut status --porcelain --untracked-files=normal spxlcast scripts infra/daily.sh Dockerfile requirements.txt pyproject.toml) {
+        $build = $build.Substring(0, 6) + "-dirty"
+    }
+}
 Run acr build -r $acr -t $image --build-arg "SPXLCAST_BUILD=$build" . -o none
 $acrServer = Query "$acr.azurecr.io" acr show -n $acr --query loginServer -o tsv
 $acrUser   = Query $acr acr credential show -n $acr --query username -o tsv
@@ -97,24 +113,28 @@ $fill = @{ LOCATION = $Location; ENV_ID = $envId; JOB_NAME = $jobName; WEB_NAME 
 function Render([string]$template, [string]$target) {
     $text = Get-Content $template -Raw
     foreach ($k in $fill.Keys) { $text = $text.Replace('${' + $k + '}', [string]$fill[$k]) }
+    if ($text -match '\$\{[A-Z0-9_]+\}') { throw "$template has a placeholder that deploy.ps1 does not fill: $($Matches[0])" }
     Set-Content -Path $target -Value $text -Encoding utf8
     $masked = $text.Replace($acrPass, "<acr-password>"); if ($fredKey) { $masked = $masked.Replace($fredKey, "<fred-key>") }
     Write-Host "---- $target ----" -ForegroundColor DarkGray; Write-Host $masked
 }
 $jobSpec = Join-Path $env:TEMP "spxlcast-job.yaml"; $webSpec = Join-Path $env:TEMP "spxlcast-web.yaml"
-Render "infra/job.yaml" $jobSpec
-Render "infra/web.yaml" $webSpec
+try {
+    Render "infra/job.yaml" $jobSpec
+    Render "infra/web.yaml" $webSpec
 
-Write-Host "`n== 5. scheduled job ($Cron UTC) ==" -ForegroundColor Yellow
-$jobExists = Exists containerapp job show -n $jobName -g $ResourceGroup
-if ($jobExists) { Run containerapp job update -n $jobName -g $ResourceGroup --yaml $jobSpec -o none }
-else            { Run containerapp job create -n $jobName -g $ResourceGroup --yaml $jobSpec -o none }
+    Write-Host "`n== 5. scheduled job ($Cron UTC) ==" -ForegroundColor Yellow
+    $jobExists = Exists containerapp job show -n $jobName -g $ResourceGroup
+    if ($jobExists) { Run containerapp job update -n $jobName -g $ResourceGroup --yaml $jobSpec -o none }
+    else            { Run containerapp job create -n $jobName -g $ResourceGroup --yaml $jobSpec -o none }
 
-Write-Host "`n== 6. status page web app ==" -ForegroundColor Yellow
-$webExists = Exists containerapp show -n $webName -g $ResourceGroup
-if ($webExists) { Run containerapp update -n $webName -g $ResourceGroup --yaml $webSpec -o none }
-else            { Run containerapp create -n $webName -g $ResourceGroup --yaml $webSpec -o none }
-Remove-Item $jobSpec, $webSpec -ErrorAction SilentlyContinue   # rendered specs contain secrets
+    Write-Host "`n== 6. status page web app ==" -ForegroundColor Yellow
+    $webExists = Exists containerapp show -n $webName -g $ResourceGroup
+    if ($webExists) { Run containerapp update -n $webName -g $ResourceGroup --yaml $webSpec -o none }
+    else            { Run containerapp create -n $webName -g $ResourceGroup --yaml $webSpec -o none }
+} finally {
+    Remove-Item $jobSpec, $webSpec -ErrorAction SilentlyContinue   # rendered specs contain secrets, whatever happened
+}
 
 $fqdn = Query "<web-fqdn>" containerapp show -n $webName -g $ResourceGroup --query properties.configuration.ingress.fqdn -o tsv
 Write-Host ""

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
 from .config import FRED_SERIES, MODEL_VERSION, Config
 from .data import MarketSnapshot, load_market
@@ -18,6 +19,30 @@ from .live import GRID_PERCENTILES
 from .montecarlo import SimulationResult, simulate
 from .rating import Rating, rate
 from .sentiment import SentimentResult, analyze_news
+
+
+MONTHLY_FRED_MAX_AGE_DAYS = 100   # monthly series are dated the 1st and published 5-10 weeks later
+
+
+def _stale_fred(snap: MarketSnapshot) -> List[str]:
+    """FRED series that stopped updating: a daily series more than ``max_stale_sessions`` sessions
+    behind the trading calendar, a monthly one older than MONTHLY_FRED_MAX_AGE_DAYS."""
+    if snap.calendar is None or not len(snap.calendar):
+        return []
+    end = pd.Timestamp(snap.calendar[-1])
+    out = []
+    for sid, s in snap.fred.items():
+        s = s.dropna() if s is not None else None
+        if s is None or len(s) < 2:
+            continue
+        last = pd.Timestamp(s.index[-1])
+        if pd.Series(s.index[-6:]).diff().median() > pd.Timedelta(days=20):   # a monthly series
+            stale = (end.date() - last.date()).days > MONTHLY_FRED_MAX_AGE_DAYS
+        else:
+            stale = snap._sessions_between(last, end) > snap.max_stale_sessions
+        if stale:
+            out.append(sid)
+    return out
 
 
 @dataclass
@@ -44,15 +69,30 @@ class Forecast:
     def data_quality(self) -> Dict[str, Any]:
         """Problems with this run's inputs (``flags`` empty = clean), logged with the track record."""
         flags: List[str] = []
-        n_fred = len(self.snap.fred)
+        snap = self.snap
+        n_fred = len(snap.fred)
         if self.cfg.use_fred:
             if n_fred == 0:
                 flags.append("fred:none")
             elif n_fred < len(FRED_SERIES):
                 flags.append("fred:partial")
-        for name, value in (("vix", self.macro.vix), ("vix3m", self.macro.vix3m), ("vix6m", self.macro.vix6m)):
+            if _stale_fred(snap):
+                flags.append("fred:stale")
+        spot_date = snap.last_date(self.cfg.etf)
+        if spot_date is not None and snap.calendar is not None and len(snap.calendar) \
+                and snap._sessions_between(spot_date, snap.calendar[-1]) > 1:
+            flags.append("spot:stale")   # one session behind is still the latest close (index shows today's bar)
+        pillars = [(name, snap.last_date(ticker), value) for name, ticker, value in (
+            ("vix", "^VIX", self.macro.vix), ("vix3m", "^VIX3M", self.macro.vix3m), ("vix6m", "^VIX6M", self.macro.vix6m))]
+        # every pillar should be as of the newest of the spot and the pillars themselves (the spot can lag too)
+        ref = max((d for d in [spot_date] + [d for _, d, v in pillars if v is not None] if d is not None), default=None)
+        for name, last, value in pillars:
             if value is None:
                 flags.append(f"{name}:missing")
+            elif ref is not None and last is not None and last.date() < ref.date():
+                flags.append(f"{name}:stale")   # e.g. at 09:40 ET Yahoo has no bar yet for today's VIX3M/VIX6M
+        if self.etf.calibration is None:
+            flags.append("etf:uncalibrated")
         src = self.fundamentals.sources
         if "default" in src.get("earnings_yield", ""):
             flags.append("earnings:default")
@@ -85,12 +125,23 @@ class Forecast:
         return rows
 
     def limit_ladder(self, horizon: int, probs=(0.9, 0.75, 0.5, 0.25, 0.1)) -> List[Dict[str, float]]:
-        """Buy-limit prices with the given probability of being touched before ``horizon``."""
+        """Buy-limit prices with the given probability of being touched before ``horizon``.
+
+        Paths that never trade below the start have a path minimum of exactly the spot. When they are
+        more than 1 - p of all paths (short horizons), no price below the spot fills with probability p:
+        those targets collapse into a single at-market rung at the spot, which fills on every path."""
         mins = self.sim.path_min[horizon]
         ends = self.sim.terminal[horizon]
-        rows = []
+        p_below = float(np.mean(mins < self.spot))
+        rows: List[Dict[str, float]] = []
+        at_market = False
         for p in probs:
-            level = float(np.percentile(mins, 100.0 * p))  # P(min <= level) = p
+            if p >= p_below:
+                if at_market:
+                    continue
+                at_market, level, p = True, self.spot, 1.0
+            else:
+                level = float(np.percentile(mins, 100.0 * p))  # P(min <= level) = p
             filled = ends[mins <= level]                    # only the paths where the order fills
             cond_median = float(np.median(filled)) if len(filled) else float("nan")
             rows.append({"p_fill": p, "price": level, "vs_spot": level / self.spot - 1.0,
@@ -146,7 +197,7 @@ def run_forecast(cfg: Config) -> Forecast:
         sim_for_rating = simulate(**rating_sim_inputs)
 
     sigma_h = vol.total_vol(cfg.rating_horizon)
-    sigma_1y = vol.total_vol(min(252, T))
+    sigma_1y = vol.one_year_vol if vol.one_year_vol is not None else vol.total_vol(252)
     context = {
         "drift": f"S&P 500 expected total return {expected.final:+.1%}/yr "
                  f"(E/P {fund.earnings_yield:.1%}, div yield {fund.dividend_yield:.1%}, "

@@ -7,15 +7,21 @@
 * PIT (where the outcome fell in the predicted distribution) from a quantile grid.
 * Overlap-aware uncertainty: forecasts made a day (or a month) apart share most of their outcome
   window, so their errors are not independent. ``effective_n`` counts how many non-overlapping
-  windows the sample really holds, and ``block_bootstrap`` gives confidence intervals that respect
-  the overlap by resampling whole blocks of consecutive forecasts.
+  windows the sample really holds, and ``mean_interval`` / ``proportion_interval`` /
+  ``skill_interval`` give closed-form intervals on that many observations (t intervals, and a
+  Wilson interval for a hit rate). In simulations of perfectly calibrated daily forecasts the
+  nominal 90% intervals for mean PIT and skill cover about 82-90% at three to seven independent
+  outcomes and 88-93% from about a dozen on; the hit-rate interval is conservative (94-98%), because
+  hits of overlapping windows are less correlated than the windows. A moving-block bootstrap with a block
+  of one window, the obvious alternative, keeps only about 2/3 of the variance of an
+  overlapping-window mean and degenerates with few blocks.
 
 Everything works in log-return space so scores are comparable across price levels and dates.
 """
 from __future__ import annotations
 
 import math
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 
@@ -84,45 +90,69 @@ def skill(model_scores: Sequence[float], baseline_scores: Sequence[float]) -> fl
 # Overlap-aware uncertainty
 # ---------------------------------------------------------------------------------------
 def effective_n(positions: Sequence[int], horizon: int) -> float:
-    """How many non-overlapping ``horizon``-long outcome windows fit in the span the forecasts
-    cover (``positions`` are the trading-session indices of the forecast dates). Equals the count
-    when the windows do not overlap; about span / horizon when they do."""
+    """How many non-overlapping ``horizon``-long outcome windows the forecasts amount to: the
+    length of the union of their windows over ``horizon`` (``positions`` are the trading-session
+    indices of the forecast dates). Equals the count when the windows do not overlap, and a gap in
+    the log adds nothing."""
     pos = np.sort(np.asarray(positions, dtype=float))
     if len(pos) == 0 or horizon <= 0:
         return 0.0
-    span = pos[-1] - pos[0] + horizon
-    return float(min(len(pos), span / horizon))
+    covered = float(np.minimum(np.diff(pos), horizon).sum()) + horizon
+    return covered / horizon
 
 
-def block_bootstrap(data: np.ndarray, block: int, stat: Callable[[np.ndarray], float] = np.mean,
-                    n_boot: int = 2000, alpha: float = 0.10, seed: int = 0) -> Tuple[float, float]:
-    """Moving-block bootstrap (1 - alpha) interval of ``stat`` for time-ordered rows whose
-    neighbours are correlated. ``block`` is the number of consecutive rows per block (about the
-    overlap length). ``data`` may be 1-D or 2-D (rows = time), so paired statistics work too.
-    Returns (nan, nan) when there are fewer than two blocks' worth of rows."""
-    x = np.asarray(data)
-    n = len(x)
-    b = int(max(1, block))
-    if n < 2 * b or n < 3:
+def _t_quantile(alpha: float, n_eff: float) -> float:
+    from scipy.stats import t
+    return float(t.ppf(1.0 - alpha / 2.0, max(n_eff - 1.0, 1.0)))
+
+
+def mean_interval(values: Sequence[float], n_eff: float, alpha: float = 0.10) -> Tuple[float, float]:
+    """(1 - alpha) t interval for the mean of overlapping-window values: the row standard deviation
+    over sqrt(n_eff), with n_eff - 1 degrees of freedom. (nan, nan) below two independent outcomes."""
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    if not n_eff >= 2 or len(x) < 2:
         return float("nan"), float("nan")
-    k = int(math.ceil(n / b))
-    rng = np.random.default_rng(seed)
-    starts = rng.integers(0, n - b + 1, size=(n_boot, k))
-    idx = (starts[:, :, None] + np.arange(b)[None, None, :]).reshape(n_boot, -1)[:, :n]
-    vals = np.array([stat(x[i]) for i in idx], dtype=float)
-    vals = vals[np.isfinite(vals)]
-    if len(vals) < n_boot // 2:
+    half = _t_quantile(alpha, n_eff) * float(x.std(ddof=1)) / math.sqrt(n_eff)
+    return float(x.mean() - half), float(x.mean() + half)
+
+
+def proportion_interval(p_hat: float, n_eff: float, alpha: float = 0.10) -> Tuple[float, float]:
+    """(1 - alpha) Wilson interval for a hit rate observed over n_eff independent trials; never
+    zero-width, even at 0% or 100%."""
+    if not (n_eff > 0 and np.isfinite(p_hat)):
         return float("nan"), float("nan")
-    lo, hi = np.quantile(vals, [alpha / 2.0, 1.0 - alpha / 2.0])
-    return float(lo), float(hi)
+    from scipy.stats import norm
+    z = float(norm.ppf(1.0 - alpha / 2.0))
+    p, n = min(max(float(p_hat), 0.0), 1.0), float(n_eff)
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def spearman(a: np.ndarray, b: Optional[np.ndarray] = None) -> float:
-    """Rank correlation; ``a`` may be a 2-column array (for use as a bootstrap statistic)."""
-    if b is None:
-        a, b = a[:, 0], a[:, 1]
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+def skill_interval(model_scores: Sequence[float], baseline_scores: Sequence[float], n_eff: float,
+                   alpha: float = 0.10) -> Tuple[float, float]:
+    """(1 - alpha) interval for skill = 1 - mean(model) / mean(baseline) = mean(baseline - model) /
+    mean(baseline) on paired rows: a t interval on n_eff for the mean difference, as in
+    ``mean_interval``, over mean(baseline). (A delta-method interval on the ratio is narrowest when
+    its estimate is furthest off, and covered only 75% at three independent outcomes.)"""
+    m = np.asarray(model_scores, dtype=float)
+    b = np.asarray(baseline_scores, dtype=float)
+    ok = np.isfinite(m) & np.isfinite(b)
+    m, b = m[ok], b[ok]
+    if not n_eff >= 2 or len(m) < 2 or not b.mean() > 0:
+        return float("nan"), float("nan")
+    d = b - m
+    half = _t_quantile(alpha, n_eff) * float(d.std(ddof=1)) / math.sqrt(n_eff)
+    return float((d.mean() - half) / b.mean()), float((d.mean() + half) / b.mean())
+
+
+def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rank correlation (average ranks for ties, nan for a constant input)."""
+    from scipy.stats import rankdata
+    ra = rankdata(a)
+    rb = rankdata(b)
     if ra.std() == 0 or rb.std() == 0:
         return float("nan")
     return float(np.corrcoef(ra, rb)[0, 1])
