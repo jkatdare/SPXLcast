@@ -1,0 +1,3 @@
+# Pre-registration files are hashed (research/PREREG_HASH.txt). Keep LF endings in every checkout,
+# including Windows ones with core.autocrlf=true, so the recorded SHA-256 values stay reproducible.
+* text eol=lf

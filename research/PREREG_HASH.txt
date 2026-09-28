@@ -1,0 +1,9 @@
+SPXL timing-signal search: pre-registration hashes
+frozen_utc: 2026-09-27T16:49:20Z
+algorithm: SHA-256 of the files' bytes as written (UTF-8, LF line endings; research/.gitattributes keeps LF in every checkout)
+
+6452feeec9c43727f38eeff29322e7a4e075cf60863af5c7591081913d0c237b  research/PREREGISTRATION.md
+696a8939bcb4e8b8492a2094066c738136314006d599b407bff3c4ed8b42b785  research/prereg.json
+
+verify: sha256sum research/PREREGISTRATION.md research/prereg.json
+unseal token for the Test phase: the SHA-256 of research/PREREGISTRATION.md above

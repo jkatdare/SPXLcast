@@ -71,7 +71,8 @@ def test_score_log_against_synthetic_history(tmp_path):
     assert hs[21].n_eff == pytest.approx((55 + 21) / 21)
     assert all(np.isfinite(hs[21].mean_pit_ci)) and all(np.isfinite(hs[21].crps_skill_ci))
     assert hs[126].n_eff < 3 and all(np.isnan(hs[126].mean_pit_ci))   # too few independent outcomes
-    assert "HOLD" in rep.by_rating and rep.by_rating["HOLD"]["n"] == 12
+    # no logged level (these rows predate it): placed by the logged 3-month dip chance, every row at one level
+    assert sum(r["n"] for r in rep.by_drawdown_risk.values()) == 12 and len(rep.by_drawdown_risk) == 1
     assert rep.sentiment_n == 12 and rep.sentiment_corr is not None
 
 

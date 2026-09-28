@@ -23,7 +23,7 @@ from rich.markup import escape
 
 from .config import Config
 from .pipeline import forecast_to_dict, run_forecast
-from .report import ordinal, render_all, render_score
+from .report import horizon_label, ordinal, quiet_summary, render_all, render_score
 from .tracklog import DEFAULT_LOG, NO_PRICES, append_log, score_log
 
 COMMANDS = ("forecast", "price", "metrics", "news", "calibrate", "log", "score")
@@ -83,7 +83,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--price", type=_positive_float, action="append", default=None,
                    help="price level to locate in the distribution (repeatable)")
     p.add_argument("--horizons", type=_positive_int, nargs="+", default=None, help="horizons in trading days (default 5 10 21 63 126 252)")
-    p.add_argument("--rating-horizon", type=_positive_int, default=None, help="horizon used for the rating (default 126)")
+    p.add_argument("--rating-horizon", type=_positive_int, default=None,
+                   help="horizon of the buy-limit ladder and of the logged (retired) rating (default 126)")
     p.add_argument("--paths", type=_paths_int, default=None, help="Monte Carlo paths (default 50000)")
     p.add_argument("--seed", type=_nonnegative_int, default=None, help="random seed (default 42)")
     p.add_argument("--no-news", action="store_true", help="skip news sentiment")
@@ -105,12 +106,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="the run archive: forecasts store their inputs, simulator arguments and new headlines "
                         "there; `score` reads each run's fine percentile grid from it")
     p.add_argument("--plot", dest="plot_path", default=None, help="write a fan chart PNG to this path")
-    p.add_argument("--quiet", action="store_true", help="only print the rating line")
+    p.add_argument("--quiet", action="store_true", help="only print the one-line summary")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="spxlcast", description="Fundamentals-driven SPXL forecast, rating and price percentiles")
+    parser = argparse.ArgumentParser(prog="spxlcast", description="Fundamentals-driven SPXL forecast: leverage cost, "
+                                                                  "drawdown risk and price percentiles")
     sub = parser.add_subparsers(dest="command")
     p_fc = sub.add_parser("forecast", help="full report (default)")
     _add_common(p_fc)
@@ -233,21 +235,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write_atomic(args.plot_path, lambda fh: save_fan_chart(fc, fh, prices, fmt=fmt))
 
     if args.quiet or args.command == "log":
-        console.print(f"{cfg.etf} {fc.spot:,.2f} ({fc.spot_status} {fc.spot_date})  rating {fc.rating.label} "
-                      f"({fc.rating.conviction.lower()}, score {fc.rating.score:+.2f} +/- {fc.rating.score_se:.2f}) "
-                      f"over {fc.rating.horizon}d; median {fc.rating.median_return:+.1%}, mean {fc.rating.mean_return:+.1%}, "
-                      f"P(beat T-bill) {fc.rating.p_beat_rf:.0%}")
+        console.print(f"{cfg.etf} {fc.spot:,.2f} ({fc.spot_status} {fc.spot_date})  {quiet_summary(fc)}",
+                      markup=False, highlight=False, soft_wrap=True)
         for p in prices:
             rows = fc.price_lookup(p)
             r = next(x for x in rows if x["horizon"] == fc.rating.horizon)
-            console.print(f"  price {p:,.2f}: {ordinal(r['percentile'])} percentile at {fc.rating.horizon}d, "
-                          f"P(dips to it) {r['p_touch_below']:.0%}, P(rises to it) {r['p_touch_above']:.0%}")
+            dips = p <= fc.spot
+            console.print(f"  price {p:,.2f}: {ordinal(r['percentile'])} percentile of the price in "
+                          f"{horizon_label(r['horizon'])}, {r['p_touch_below' if dips else 'p_touch_above']:.0%} chance "
+                          f"it {'dips' if dips else 'rises'} to it before then")
         if log_file and logged is None:
             console.print(f"appended to {log_file}", style="dim", markup=False, highlight=False)
     else:
         sections = {
             "forecast": None,
-            "price": {"header", "rating", "price", "ladder", "notes"},
+            "price": {"header", "assessment", "price", "ladder", "notes"},
             "metrics": {"header", "metrics", "sensitivity", "notes"},
             "news": {"header", "news", "notes"},
             "calibrate": {"header", "drivers", "sensitivity", "notes"},

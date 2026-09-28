@@ -1,4 +1,5 @@
-"""End-to-end pipeline: data -> drivers -> simulation -> rating, plus a JSON-able summary."""
+"""End-to-end pipeline: data -> drivers -> simulation -> assessment (and the retired rating, still
+logged for research), plus a JSON-able summary."""
 from __future__ import annotations
 
 import math
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from .assess import DIP_HORIZON, Assessment, assess, assessment_to_dict
 from .config import FRED_SERIES, MODEL_VERSION, Config
 from .data import MarketSnapshot, load_market
 from .env import build_id
@@ -59,12 +61,13 @@ class Forecast:
     etf: ETFParams
     sentiment: Optional[SentimentResult]
     sim: SimulationResult
-    rating: Rating
+    rating: Rating                        # no longer shown: logged for continuity and research
     sensitivities: List[Sensitivity] = field(default_factory=list)
     mu_path: Optional[np.ndarray] = None
     # The exact arguments passed to montecarlo.simulate, so an archived run can be replayed.
     sim_inputs: Optional[Dict[str, Any]] = None
     rating_sim_inputs: Optional[Dict[str, Any]] = None   # the untilted run behind the rating, when separate
+    assessment: Optional[Assessment] = None              # leverage cost, drawdown risk, 3-month range (assess.py)
 
     def data_quality(self) -> Dict[str, Any]:
         """Problems with this run's inputs (``flags`` empty = clean), logged with the track record."""
@@ -162,7 +165,7 @@ def run_forecast(cfg: Config) -> Forecast:
     fund = build_fundamentals(snap, cfg, inflation=expected_inflation(macro, cfg))
     expected = expected_index_return(fund, macro, cfg)
 
-    horizons = sorted(set(int(h) for h in cfg.horizons) | {int(cfg.rating_horizon)})
+    horizons = sorted(set(int(h) for h in cfg.horizons) | {int(cfg.rating_horizon), DIP_HORIZON})
     T = max(horizons)
     vol = vol_term_structure(macro, snap, cfg, T)
     etf = build_etf_params(snap, cfg, macro.rf_3m)
@@ -204,7 +207,7 @@ def run_forecast(cfg: Config) -> Forecast:
                  f"valuation and regime adj {sum(expected.adjustments.values()):+.1%})",
         "vol": f"Implied vol {sigma_h:.0%} to the rating horizon -> leverage decay about "
                f"{etf.theoretical_drag(sigma_h):.0%}/yr; fund costs {etf.annual_cost:.1%}/yr; "
-               f"the index needs about {etf.breakeven_index_return(sigma_1y):+.1%}/yr for SPXL's median to be flat over a year",
+               f"the index needs about {etf.breakeven_index_return(sigma_1y):+.1%}/yr for SPXL to break even over the long run",
     }
     if sentiment is not None:
         context["sentiment"] = (f"News sentiment {sentiment.label.lower()} ({sentiment.score:+.2f}) "
@@ -219,10 +222,12 @@ def run_forecast(cfg: Config) -> Forecast:
 
     rating = rate(sim_for_rating, cfg.rating_horizon, cfg, context)
     sens = influencer_sensitivities(snap, cfg)
-    return Forecast(cfg=cfg, snap=snap, spot=spot, spot_date=spot_date, spot_status=spot_status, macro=macro,
-                    fundamentals=fund, expected=expected, vol=vol, etf=etf, sentiment=sentiment, sim=sim,
-                    rating=rating, sensitivities=sens, mu_path=mu, sim_inputs=sim_inputs,
-                    rating_sim_inputs=rating_sim_inputs)
+    fc = Forecast(cfg=cfg, snap=snap, spot=spot, spot_date=spot_date, spot_status=spot_status, macro=macro,
+                  fundamentals=fund, expected=expected, vol=vol, etf=etf, sentiment=sentiment, sim=sim,
+                  rating=rating, sensitivities=sens, mu_path=mu, sim_inputs=sim_inputs,
+                  rating_sim_inputs=rating_sim_inputs)
+    fc.assessment = assess(fc)
+    return fc
 
 
 # ---------------------------------------------------------------------------------------
@@ -252,6 +257,8 @@ def forecast_to_dict(fc: Forecast, prices: Optional[List[float]] = None) -> Dict
         "spot": fc.spot,
         "spot_date": fc.spot_date,
         "spot_status": fc.spot_status,
+        "assessment": assessment_to_dict(fc.assessment) if fc.assessment is not None else None,
+        # the retired verdict, kept for continuity and research; not shown as a recommendation
         "rating": {
             "label": fc.rating.label, "conviction": fc.rating.conviction, "score": fc.rating.score,
             "score_se": fc.rating.score_se, "borderline": fc.rating.borderline,

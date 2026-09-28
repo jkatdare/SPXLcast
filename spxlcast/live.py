@@ -6,7 +6,9 @@ without re-simulating: the simulated distribution is a distribution of *returns*
 spot, so when SPXL trades at a new price every simulated price scales by ``spot / base_spot``.
 Fixed dollar levels (the price checks, the buy-limit ladder) are re-read off the fine percentile
 grids that ``forecast_to_dict`` stores for the terminal price, the path minimum and the path
-maximum. The rating is a function of returns only, so it is unchanged until the next full run.
+maximum. The assessment's leverage cost and drawdown chance are about returns, so they are unchanged
+until the next full run; its 3-month price range scales with the quote like every other price. (The
+retired rating, also a function of returns, is carried along for the spot log.)
 
 Every minute during the session the loop fetches the latest quote, writes ``output/live.json``
 and appends one row to ``logs/spot_log.csv`` (a minute-by-minute price record for later
@@ -138,6 +140,13 @@ def reprice(base: Dict, spot: float, now: Optional[datetime] = None,
 
     ladder = {h: [{**row, "price": float(row["price"]) * ratio} for row in rows]
               for h, rows in (base.get("limit_ladder") or {}).items()}
+    assessment = base.get("assessment")
+    if isinstance(assessment, dict):        # a forecast.json from before the assessment has none
+        rng = assessment.get("range_3m")
+        assessment = {**assessment, "range_3m": {k: v * ratio if isinstance(v, (int, float)) else None
+                                                 for k, v in rng.items()} if isinstance(rng, dict) else None}
+    else:
+        assessment = None
     r = base["rating"]
     return {
         "asof": now_utc.isoformat(timespec="seconds"),
@@ -149,6 +158,7 @@ def reprice(base: Dict, spot: float, now: Optional[datetime] = None,
         "base_run_at": _run_id(base.get("run_at")),     # joins forecast_log.run_at as a string
         "base_spot_status": base.get("spot_status"),
         "change_vs_base": ratio - 1.0,
+        "assessment": assessment,
         "rating": {"label": r["label"], "conviction": r["conviction"], "score": r["score"],
                    "score_se": r.get("score_se"), "horizon_days": r["horizon_days"]},
         "horizons": horizons,
@@ -233,7 +243,7 @@ def refresh_once(root: str, fetch: Callable[[str], Optional[float]] = fetch_spot
         cur = _load_live(root)
         if cur is not None and _run_id(cur.get("base_run_at")) == _run_id(base.get("run_at")):
             return None
-        # a full run landed during a quote outage: show it at its own price, not the last run's rating
+        # a full run landed during a quote outage: show it at its own price, not the last run's assessment
         live = reprice(base, float(base["spot"]), now=_utc(base.get("run_at")))
         write_live(root, live)
         return live

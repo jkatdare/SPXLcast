@@ -30,14 +30,23 @@ Reported:
 5. Skill (CRPS, lower is better) against the same engine with a constant 7% drift, which isolates
    the fundamentals, and against a naive lognormal at the raw VIX with a T-bill drift, which
    isolates everything.
+6. Leverage cost and drawdown risk, the assessment the page shows (spxlcast/assess.py, computed
+   here by the same functions): their tercile cutoffs, how often a 20% dip within 3 months followed
+   at each drawdown-risk level, the predicted fund cost plus volatility drag against the realised
+   (3 x the index's log return minus the fund's, per year over the next 6 months), and, for
+   information only, forward returns by leverage-cost level. These go to reference.json, which
+   ``--write-reference`` also copies into the package for the live page.
 
 Usage:  py scripts/backtest_rating.py [--paths 20000] [--start 1990-01] [--term-structure impute]
         [--refresh]   (re-download Yahoo, FRED and Shiller data; otherwise a local cache is used)
+        [--write-reference]   (copy output/backtest/reference.json to spxlcast/reference.json)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -52,6 +61,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from backtest_drift import load_shiller                                         # noqa: E402
+from spxlcast.assess import (DIP_HORIZON, DRAWDOWN_LEVELS, LEVERAGE_LEVELS, REFERENCE_PATH,  # noqa: E402
+                             leverage_cost, level_of, sigma_1y)
 from spxlcast.config import Config                                             # noqa: E402
 from spxlcast.data import MarketSnapshot, _fred_api                            # noqa: E402
 from spxlcast.env import fred_api_key                                          # noqa: E402
@@ -231,7 +242,9 @@ def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
     expected = expected_index_return(fund, macro, cfg)
     T = max(HORIZONS)
     vol = vol_term_structure(macro, MarketSnapshot(asof=datetime.now(timezone.utc)), cfg, T)
-    annual_cost = cfg.expense_ratio_default + (cfg.leverage_target - 1) * (macro.rf_3m + cfg.swap_spread)
+    financing = (cfg.leverage_target - 1) * (macro.rf_3m + cfg.swap_spread)
+    annual_cost = cfg.expense_ratio_default + financing
+    lc = leverage_cost(cfg.leverage_target, cfg.expense_ratio_default, financing, sigma_1y(vol), expected.final, None)
     kw = dict(spot=1.0, sigma_annual=vol.daily, leverage=cfg.leverage_target, daily_cost=annual_cost / 252.0,
               tracking_sd_daily=TRACKING_SD, rf_annual=macro.rf_3m, horizons=HORIZONS, n_paths=cfg.n_paths,
               dof=cfg.t_dof, skew_gamma=cfg.skew_gamma, max_daily_move=cfg.max_daily_move, seed=cfg.seed,
@@ -250,7 +263,9 @@ def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
            "ts_imputed": inp["ts_imputed"], "vol_6m": vol.total_vol(RATING_H), "annual_cost": annual_cost,
            "label": rating.label, "score": rating.score, "score_se": rating.score_se, "edge": rating.edge_annual,
            "sharpe": rating.sharpe_annual, "borderline": rating.borderline,
-           "label_const7": rating7.label, "score_const7": rating7.score}
+           "label_const7": rating7.label, "score_const7": rating7.score,
+           "hurdle": lc.hurdle, "lc_fees": lc.fees, "lc_financing": lc.financing, "lc_drag": lc.drag,
+           "sigma_1y": lc.sigma, "p_dip20_3m": sim.summary(DIP_HORIZON)["p_drawdown_20"]}
     fund_level = d["fund"].values
     for h in HORIZONS:
         if pos + h >= len(d):
@@ -270,6 +285,9 @@ def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
             f"crps_naive_{h}": crps_normal(m, s, y),
             f"pred_dd20_{h}": float(np.mean(sim.path_min[h] <= 0.8)), f"real_dd20_{h}": float(window.min() <= 0.8),
         })
+        if h == RATING_H:   # realised fund cost + volatility drag per year: L x index log return - fund log return
+            rec["real_cost"] = (cfg.leverage_target * float(np.log(d["tr"].values[pos + h] / d["tr"].values[pos]))
+                                - y) * 252.0 / h
     return rec
 
 
@@ -468,6 +486,134 @@ def skill_section(o: pd.DataFrame) -> List[str]:
     return out
 
 
+# ---------------------------------------------------------------------------------------
+# Leverage cost and drawdown risk: the assessment the page shows, and its reference.json
+# ---------------------------------------------------------------------------------------
+GRID_PCTS = list(range(0, 101, 5))
+
+
+def _r(v, nd: int = 6):
+    v = float(v)
+    return round(v, nd) if np.isfinite(v) else None
+
+
+def _terciles(x: pd.Series) -> Dict:
+    x = x.dropna().values
+    return {"grid": [_r(v) for v in np.percentile(x, GRID_PCTS)],
+            "cutoffs": [_r(v) for v in np.percentile(x, [100.0 / 3.0, 200.0 / 3.0])]}
+
+
+def _cost_frame(o: pd.DataFrame, since: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    e = o.dropna(subset=["real_cost"]) if "real_cost" in o else o.iloc[0:0].assign(real_cost=np.nan)
+    return e[e["date"] >= since] if since is not None else e
+
+
+def _cost_check(e: pd.DataFrame, pred: pd.Series) -> Dict:
+    """Predicted fund cost + volatility drag per year against the realised over the next 6 months."""
+    n_eff = effective_n(e["pos"], RATING_H)
+    corr = float(pred.corr(e["real_cost"])) if len(e) > 2 else float("nan")
+    return {"pred_mean": float(pred.mean()), "real_mean": float(e["real_cost"].mean()), "corr": corr, "n": int(len(e)),
+            "n_indep": n_eff, "diff_ci": mean_interval((e["real_cost"] - pred).values, n_eff),
+            "corr_ci": _corr_ci(corr, n_eff)}
+
+
+def build_reference(o: pd.DataFrame, source: str) -> Dict:
+    """The tercile cutoffs and history spxlcast/assess.py places a live run against."""
+    h = DIP_HORIZON
+    ref = {"source": source, "period": f"{o['date'].iloc[0]:%Y-%m}..{o['date'].iloc[-1]:%Y-%m}", "n": int(len(o)),
+           "hurdle": _terciles(o["hurdle"]),
+           "p_dip20_3m": {**_terciles(o["p_dip20_3m"]), "median": _r(o["p_dip20_3m"].median())}}
+    by_level = {}
+    if f"real_dd20_{h}" in o:
+        e = o.dropna(subset=[f"real_dd20_{h}"])
+        # classified on the rounded cutoffs the live page reads back
+        lvl = e["p_dip20_3m"].map(lambda p: level_of(p, ref["p_dip20_3m"]["cutoffs"], DRAWDOWN_LEVELS))
+        for lab in DRAWDOWN_LEVELS:
+            g = e[lvl == lab]
+            if len(g):
+                by_level[lab] = {"pred": _r(g["p_dip20_3m"].mean()), "real": _r(g[f"real_dd20_{h}"].mean()),
+                                 "n": int(len(g)), "n_indep": _r(effective_n(g["pos"], h), 1)}
+    ref["p_dip20_3m"]["by_level"] = by_level
+    e = _cost_frame(o, SPXL_FROM)       # SPXL itself: before it the synthetic fund charges the model's own costs
+    c = _cost_check(e, e["lc_fees"] + e["lc_financing"] + e["lc_drag"])
+    ref["leverage_cost_check"] = {"pred_mean": _r(c["pred_mean"]), "real_mean": _r(c["real_mean"]), "corr": _r(c["corr"], 3),
+                                  "n": c["n"], "n_indep": _r(c["n_indep"], 1),
+                                  "period": f"{e['date'].iloc[0]:%Y-%m}..{e['date'].iloc[-1]:%Y-%m}" if len(e) else None}
+    return ref
+
+
+def assessment_section(o: pd.DataFrame, ref: Dict, cfg: Config) -> List[str]:
+    hu, dp = ref["hurdle"], ref["p_dip20_3m"]
+    (hlo, hhi), (dlo, dhi) = hu["cutoffs"], dp["cutoffs"]
+    out = [f"Leverage cost and drawdown risk (what the page shows; levels are terciles of these {ref['n']} month-ends)",
+           f"Leverage cost = the S&P 500 total return per year SPXL needs to break even over the long run (its average "
+           f"log growth is then zero): low below "
+           f"{hlo:.1%}, normal {hlo:.1%} to {hhi:.1%}, high {hhi:.1%} and above (median {hu['grid'][10]:.1%}, "
+           f"range {hu['grid'][0]:.1%} to {hu['grid'][-1]:.1%})",
+           f"Drawdown risk = the predicted chance SPXL closes at least 20% below the month-end price within 3 months: low below "
+           f"{dlo:.1%}, normal {dlo:.1%} to {dhi:.1%}, elevated {dhi:.1%} and above (median {dp['median']:.1%}, "
+           f"range {dp['grid'][0]:.1%} to {dp['grid'][-1]:.1%})"]
+
+    h = DIP_HORIZON
+    out.append("\nDid a 20% dip within 3 months follow as often as predicted? By drawdown-risk level [90% CI, overlap-aware]")
+    rows = []
+    if f"real_dd20_{h}" in o:
+        e = o.dropna(subset=[f"real_dd20_{h}"])
+        lvl = e["p_dip20_3m"].map(lambda p: level_of(p, dp["cutoffs"], DRAWDOWN_LEVELS))
+        for lab in DRAWDOWN_LEVELS + ("all",):
+            g = e if lab == "all" else e[lvl == lab]
+            if not len(g):
+                continue
+            n_eff, real = effective_n(g["pos"], h), g[f"real_dd20_{h}"].mean()
+            rows.append({"level": lab, "predicted from..to": f"{g['p_dip20_3m'].min():.0%} to {g['p_dip20_3m'].max():.0%}",
+                         "months": len(g), "independent": f"{n_eff:.0f}", "predicted (mean)": f"{g['p_dip20_3m'].mean():.1%}",
+                         "happened [90% CI]": f"{real:.1%} {_ci(*proportion_interval(real, n_eff), '{:.0%}')}"})
+    out.append(pd.DataFrame(rows).to_string(index=False) if rows else NO_OUTCOMES)
+
+    L = cfg.leverage_target
+    out.append("\nLeverage cost check: predicted fund cost + volatility drag per year (fees + financing + L(L-1)/2 x vol^2, "
+               "vol the 1-year implied as on the page) vs realised over the next 6 months (3 x the S&P 500's log return "
+               "minus the fund's, per year) [90% CI, overlap-aware]")
+    rows = []
+    for name, since, vol_col in (("SPXL", SPXL_FROM, "sigma_1y"), ("SPXL, drag at the 6-month vol", SPXL_FROM, "vol_6m"),
+                                 ("all, synthetic fund before 2009", None, "sigma_1y")):
+        e = _cost_frame(o, since)
+        if not len(e):
+            continue
+        c = _cost_check(e, e["lc_fees"] + e["lc_financing"] + 0.5 * L * (L - 1.0) * e[vol_col] ** 2)
+        rows.append({"sample": f"{name} {e['date'].iloc[0]:%Y-%m}..{e['date'].iloc[-1]:%Y-%m}", "months": c["n"],
+                     "independent": f"{c['n_indep']:.0f}", "predicted": f"{c['pred_mean']:.1%}",
+                     "realised": f"{c['real_mean']:.1%}",
+                     "realised minus predicted": f"{c['real_mean'] - c['pred_mean']:+.1%} {_ci(*c['diff_ci'])}",
+                     "correlation": f"{c['corr']:+.2f} {_ci(*c['corr_ci'], '{:+.2f}')}"})
+    out.append(pd.DataFrame(rows).to_string(index=False) if rows else NO_OUTCOMES)
+    if rows:
+        out.append("(before 2009 the synthetic fund charges the model's own fees and financing, so there only the drag is tested)")
+
+    H = RATING_H
+    out.append("\nFor information only, not a signal: forward 6-month SPXL return minus T-bills by leverage-cost level "
+               "[90% CI, overlap-aware]")
+    rows = []
+    if f"excess_{H}" in o:
+        ev = o.dropna(subset=[f"excess_{H}"])
+        lvl = ev["hurdle"].map(lambda x: level_of(x, hu["cutoffs"], LEVERAGE_LEVELS))
+        for lab in LEVERAGE_LEVELS:
+            sel = lvl == lab
+            g = ev[sel]
+            if not len(g):
+                continue
+            lo, hi = _diff_ci(ev[f"excess_{H}"], sel, ev["pos"], H)
+            rows.append({"level": lab, "hurdle from..to": f"{g['hurdle'].min():.1%} to {g['hurdle'].max():.1%}",
+                         "months": len(g), "independent": f"{effective_n(g['pos'], H):.0f}",
+                         "mean": f"{g[f'excess_{H}'].mean():+.1%}", "median": f"{g[f'excess_{H}'].median():+.1%}",
+                         "P(beat T-bill)": f"{(g[f'excess_{H}'] > 0).mean():.0%}",
+                         "minus the other months [90% CI]":
+                             (f"{g[f'excess_{H}'].mean() - ev.loc[~sel, f'excess_{H}'].mean():+.1%} {_ci(lo, hi)}"
+                              if (~sel).any() else "n/a (every month)")})
+    out.append(pd.DataFrame(rows).to_string(index=False) if rows else NO_OUTCOMES)
+    return out
+
+
 def plot(o: pd.DataFrame, cfg: Config, path: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -551,6 +697,9 @@ def run(args) -> None:
              "Intervals: 90%, closed form on the number of independent outcome windows (t for means, Wilson for "
              "band hits, a t interval on the difference for skill and for rating differences, Fisher z for rank correlations)",
              ""]
+    ref = build_reference(o, f"scripts/backtest_rating.py, run {datetime.now(timezone.utc):%Y-%m-%d}, "
+                             f"{args.paths} paths per month-end")
+    lines += assessment_section(o, ref, cfg) + [""]
     if f"excess_{RATING_H}" in o and o[f"excess_{RATING_H}"].notna().any():
         lines += rating_section(o) + [""] + threshold_section(o) + [""]
     else:
@@ -560,10 +709,15 @@ def run(args) -> None:
     lines += calibration_section(o) + [""] + skill_section(o)
     report = "\n".join(lines)
     (out_dir / "rating_backtest.txt").write_text(report + "\n", encoding="utf-8")
+    ref_path = out_dir / "reference.json"
+    ref_path.write_text(json.dumps(ref, indent=1, allow_nan=False) + "\n", encoding="utf-8")
     plot(o, cfg, out_dir / "rating_backtest.png")
     print(report)
-    print(f"\nwrote {out_dir / 'rating_backtest.csv'}, rating_backtest.txt, rating_backtest.png "
+    print(f"\nwrote {out_dir / 'rating_backtest.csv'}, rating_backtest.txt, rating_backtest.png, reference.json "
           f"({time.time() - t0:.0f}s)")
+    if getattr(args, "write_reference", False):
+        shutil.copyfile(ref_path, REFERENCE_PATH)
+        print(f"copied reference.json to {REFERENCE_PATH}")
 
 
 if __name__ == "__main__":
@@ -572,6 +726,8 @@ if __name__ == "__main__":
     ap.add_argument("--start", default="1990-01")
     ap.add_argument("--term-structure", choices=("impute", "flat"), default="impute")
     ap.add_argument("--refresh", action="store_true", help="re-download the input data")
+    ap.add_argument("--write-reference", action="store_true",
+                    help="also copy reference.json into the package (spxlcast/reference.json), where the page reads it")
     ap.add_argument("--out", default=str(ROOT / "output" / "backtest"))
     pd.set_option("display.width", 250, "display.max_columns", 30, "display.max_colwidth", 60)
     run(ap.parse_args())

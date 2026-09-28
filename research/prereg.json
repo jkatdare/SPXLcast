@@ -1,0 +1,321 @@
+{
+ "title": "SPXL timing-signal search: pre-registration",
+ "version": "1.0",
+ "frozen_date": "2026-09-27",
+ "governing_document": "research/PREREGISTRATION.md (this file is its machine-readable copy of Part 2; the .md governs if they disagree)",
+ "hash_file": "research/PREREG_HASH.txt",
+ "constraints": {
+  "editable_files": ["scripts/research_signals.py", "research/*", "tests/test_research_*.py", "output/research/*"],
+  "no_technical_analysis": "No input built from the direction, trend, momentum or moving average of SPXL, the S&P 500 or any other price. Valuation ratios as levels only. Realised volatility only as a sign-blind risk measure (inside C01). Correlations with past returns are diagnostics only.",
+  "seal": "No predictive statistic using an outcome window ending after 2007-12-31 before the Test phase. Test-period predictor values may be stored but not summarised beyond missing counts.",
+  "fred_key": "spxlcast.env.fred_api_key(); never printed, logged or placed in exception messages"
+ },
+ "exposure_ledger": {
+  "readme_full_sample_1990_2026": [
+   "Retired rating score: 6-month Spearman with SPXL excess return -0.03 (90% CI -0.22 to +0.17); BUY months -4.2 points vs rest (-18.0 to +9.6); 12 SELL months (Aug-Sep 1998, Oct-Dec 2000, Oct 2008-Mar 2009, Mar 2020) followed by +39% average; no threshold worked in both halves; BUY 83% of months 2008-2021, HOLD 95% since 2022",
+   "Leverage-cost hurdle: high-cost months +9.4 points vs rest (-5.6 to +24.4), low-cost -4.1 (-16.2 to +8.0); research brief records its full-sample 6-month rank correlation was seen (about -0.03); predicted cost 13.1% vs realised 14.4% on SPXL",
+   "VIX spikes followed by strong rebounds (1998, 2008-09, 2020) noticed: any VIX-level result (C10, C11, C12, partly C01) is not a clean test",
+   "Drawdown-risk levels: 20% dip within 3 months followed 8.8/22.4/35.4% at low/normal/elevated (11.7/24.5/42.5% predicted); SPXL-only since 2009 14/25/27%",
+   "Forecast distribution: 90% bands held 91-93%; CRPS 3-15% better than naive lognormal; mean PIT 0.54-0.57; dip chance 4-6 points high at 3-6 months",
+   "Fundamentals drift with curve, HY, CPI>3.5% and Sahm penalties: 6-month CRPS skill vs constant 7% +0.4% (-0.9% to +1.7%); HY penalty inactive before 2023-09",
+   "Drift backtest 1881-2026: correlation 0.22/0.47/0.60 at 1/5/10 years; valuation term added nothing; since 1990 drift 4.8%/yr low at 1 year; S&P 500 about 15.4%/yr over 2016-09..2026-06"
+  ],
+  "parameters_fitted_on_test_period": ["0.75% swap spread and tracking noise (SPXL since 2009)", "3/5/7 vol-point VIX haircuts", "VIX3M/VIX6M imputation before 2008 (log fit on 2008-2026; feeds C11 and C12 before 2008)", "tercile cut-offs in spxlcast/reference.json"],
+  "general_knowledge": "Judge and proposers (language models) know 2008-2026 history: 2008-09 crisis, zero lower bound 2009-2015 and 2020-2021, 2020 crash/rebound/claims spike, strong returns at high valuations in the 2010s, 2021-23 inflation and 2022 rate shock and bear market, April 2020 negative oil price, missing October 2025 CPI. Mitigation: signs and definitions from pre-2008 literature, fixed now.",
+  "post_2008_literature_counts_as_seen": ["Goyal, Welch and Zafirov 2024", "Moreira and Muir 2017", "Chava, Gallmeyer and Park 2015", "Bekaert and Hoerova 2014", "Sahm 2019", "Excess CAPE yield note 2020"],
+  "training_window_is_published_evidence": "BTZ VRP sample is exactly 1990-2007; Cooper-Priestley, Ang-Bekaert and Welch-Goyal overlap it; training results are replication only",
+  "judge_opened": ["README.md", "code: spxlcast/assess.py, spxlcast/evaluation.py, spxlcast/rating.py, spxlcast/env.py, spxlcast/data._fred_api, scripts/backtest_rating.py, config values", "header line only of output/backtest/rating_backtest.csv", "date range and fetch time of output/backtest/rating_inputs.pkl", "FRED series metadata and ALFRED vintage dates (no values)"],
+  "judge_computed": "calendar quantities only (origin counts, effective_n, power); no statistic using predictors or outcomes",
+  "judge_did_not_open": ["output/backtest/rating_backtest.txt", "output/backtest/rating_backtest.png", "rows of output/backtest/rating_backtest.csv", "drift backtest outputs", "output/backtest/observations.csv", "output/backtest/summary.csv", "output/backtest/run_*.txt"],
+  "proposers_opened": "README.md and code signatures only (scripts/backtest_drift.load_shiller, spxlcast.data._fred_api); no data or results files; no statistics"
+ },
+ "calendar": {
+  "sessions": "trading days of scripts/backtest_rating.build_daily(inputs, Config()) from the pinned rating_inputs.pkl (^SP500TR calendar)",
+  "origin": "last session of each calendar month (backtest_rating.month_end_positions), 1990-01-31..2026-08-31",
+  "t_minus": "the session immediately before the origin; daily market inputs of C01-C10 use values dated on or before t-; C11 and C12 use data dated t as in the backtest",
+  "stale_daily_limit_sessions": 5,
+  "position": "decision at origin t implemented at the close of t; outcome window sessions t+1..t+h",
+  "data_cutoff": "2026-09-25"
+ },
+ "pinned_inputs": {
+  "output/backtest/rating_inputs.pkl": "d21e55055f35d91e5084f336b115b6dedcd99e8819598a1a15544851084d868e",
+  "output/backtest/rating_backtest.csv": "a272f0cadabefc75f1c88d4026444c3961cd9ce490f75ee65a763968c2fb4be4",
+  "output/backtest/ie_data.xls": "044196dafe44c3030b2facbdea023975b3f6aa68b4e52f8f9bafc403e19589c1",
+  "output/research/predictor_inputs.pkl": "downloaded once in the Train phase; SHA-256 recorded in research/TRAIN_REPORT.md",
+  "rating_backtest_csv_predictor_columns": ["date", "pos", "hurdle", "score"],
+  "on_hash_mismatch": "stop"
+ },
+ "targets": {
+  "definitions": {
+   "R_bill": "prod over i=t+1..t+h of (1 + tbill_ret_i) - 1; tbill_ret = previous day's DGS3MO / 252 (build_daily)",
+   "Y": "fund[t+h]/fund[t] - 1 - R_bill(t,h); fund = synthetic 3x through 2008-12-31, SPXL from 2009-01-02 (backtest excess_h)",
+   "S": "tr[t+h]/tr[t] - 1 - R_bill(t,h); tr = ^SP500TR (backtest sp_h - tbill_h)",
+   "D20": "1 if min over i=t+1..t+63 of fund[i]/fund[t] <= 0.8 else 0 (backtest real_dd20_63)"
+  },
+  "primary": {"target": "Y", "h": 126},
+  "secondary": [{"target": "Y", "h": 21}, {"target": "Y", "h": 63}, {"target": "S", "h": 21}, {"target": "S", "h": 63}, {"target": "S", "h": 126}, {"target": "D20", "h": 63}]
+ },
+ "split": {
+  "train_origins": "month-ends from 1990-01-31 whose window's last session <= 2007-12-31",
+  "test_origins": "month-ends from 2008-01-31 whose window's last session <= 2026-09-25",
+  "embargo": "origins between the two belong to neither",
+  "parameter_window": "month-ends 1990-01-31..2007-06-29 (predictor values only)",
+  "expected_from_calendar": {
+   "h126": {"train": ["1990-01-31", "2007-06-29", 210, 35.8], "test": ["2008-01-31", "2026-02-27", 218, 37.1]},
+   "h63": {"train": ["1990-01-31", "2007-09-28", 213, 71.7], "test": ["2008-01-31", "2026-05-29", 221, 74.2]},
+   "h21": {"train": ["1990-01-31", "2007-10-31", 214, 209.2], "test": ["2008-01-31", "2026-07-31", 223, 218.2]},
+   "format": "[first origin, last origin, count, effective_n]"
+  }
+ },
+ "candidates": [
+  {
+   "id": "C01", "short": "VRP", "name": "Variance risk premium", "sign": 1, "in_composite": true,
+   "definition": "VIX(t-)^2/12 - RV21(t-); RV21 = sum over the 21 sessions ending at t- of (100*ln(G_i/G_{i-1}))^2, G = ^GSPC close; percent squared per month",
+   "sources": ["Yahoo ^VIX (pinned pickle)", "Yahoo ^GSPC (pinned pickle)", "FRED VIXCLS cross-check only"],
+   "history_from": "1990-01-02",
+   "lag": "market closes of session t-",
+   "exposure": "partial: uses the VIX; premium negative after crashes (2008, 2020 known)",
+   "ta_flag": "realised variance used only as a sign-blind risk measure (allowed, flagged)",
+   "rationale": "Variance premium proxies aggregate risk aversion and precedes a high equity premium at 1-6 months, peaking near a quarter; for a fixed VIX a higher premium also means lower expected drag for a 3x fund",
+   "citations": ["Bollerslev, Tauchen and Zhou 2009 RFS", "Drechsler and Yaron 2011 RFS"]
+  },
+  {
+   "id": "C02", "short": "GAP", "name": "Real-time output gap", "sign": -1, "in_composite": true,
+   "definition": "INDPRO vintage in effect on origin date t (realtime_start=realtime_end=t); m = latest observation month; OLS ln IP_k = a + b*k + c*k^2 over months from max(1948-01, first observation) through m; GAP = residual at m; re-estimated at every origin",
+   "sources": ["FRED/ALFRED INDPRO (vintages from 1927-01-26)"],
+   "history_from": "1919-01 series; vintages cover every origin",
+   "lag": "vintage in effect at t (G.17 mid-month; m normally origin month minus one)",
+   "exposure": "clean apart from general knowledge",
+   "ta_flag": "none",
+   "rationale": "Countercyclical risk premia: output above trend marks low expected returns; real-time gap predicts excess returns at 1-12 months on pre-2008 data",
+   "citations": ["Cooper and Priestley 2009 RFS", "Campbell and Cochrane 1999 JPE"]
+  },
+  {
+   "id": "C03", "short": "SRATE", "name": "12-month change in the 3-month Treasury yield", "sign": -1, "in_composite": true,
+   "definition": "DGS3MO(t-) - DGS3MO(t'-), t' = the origin 12 month-ends earlier; percentage points",
+   "sources": ["FRED DGS3MO (from 1981-09-01)"],
+   "history_from": "1981-09-01",
+   "lag": "dated on or before t-",
+   "exposure": "2022 hiking cycle common knowledge",
+   "ta_flag": "none (interest rate; 12-month change chosen so no moving-average construct appears)",
+   "rationale": "Short rate above its level a year ago marks tightening; the short rate is the most robust short-horizon predictor with a negative sign",
+   "citations": ["Ang and Bekaert 2007 RFS", "Campbell 1991 Economic Journal", "Hodrick 1992 RFS"]
+  },
+  {
+   "id": "C04", "short": "TERM", "name": "Term spread", "sign": 1, "in_composite": true,
+   "definition": "DGS10(t-) - DGS3MO(t-); percentage points",
+   "sources": ["FRED DGS10", "FRED DGS3MO", "FRED T10Y3M cross-check"],
+   "history_from": "1981-09-01",
+   "lag": "dated on or before t-",
+   "exposure": "inverted-curve penalty was inside the full-sample drift test (not isolated)",
+   "ta_flag": "none",
+   "rationale": "Steep curve marks early-cycle, high risk premia; term structure forecasts excess stock returns; weak out of sample",
+   "citations": ["Campbell 1987 JFE", "Fama and French 1989 JFE", "Welch and Goyal 2008 RFS"]
+  },
+  {
+   "id": "C05", "short": "DEF", "name": "Default spread (Baa minus Aaa)", "sign": 1, "in_composite": true,
+   "definition": "DBAA(t-) - DAAA(t-); percentage points; level only",
+   "sources": ["FRED DBAA (from 1986-01-02)", "FRED DAAA (from 1983-01-03)"],
+   "history_from": "1986-01-02",
+   "lag": "dated on or before t-; not revised",
+   "exposure": "close to clean (HY penalty could not fire before 2023-09)",
+   "ta_flag": "none",
+   "rationale": "High in bad times, tracks the business-cycle component of expected returns; sign set by the risk-premium channel because the primary target is a simple excess return; variance channel tested by C10/C11",
+   "citations": ["Keim and Stambaugh 1986 JFE", "Fama and French 1989 JFE"]
+  },
+  {
+   "id": "C06", "short": "INFL", "name": "CPI inflation, year on year", "sign": -1, "in_composite": true,
+   "definition": "CPIAUCNS vintage in effect on origin date t; m = latest observation month; ln(CPI_m/CPI_{m-12}); if CPI_{m-12} missing carry forward the previous origin's value; never interpolate. Fallback if ALFRED fails: m = latest published month <= origin month minus one",
+   "sources": ["FRED/ALFRED CPIAUCNS (NSA; vintages from 1949)"],
+   "history_from": "1913-01",
+   "lag": "vintage at t (about 10-15 days after the reference month)",
+   "exposure": "2021-23 inflation and 2022 bear market known; CPI>3.5% penalty inside the drift test",
+   "ta_flag": "none",
+   "rationale": "High inflation precedes low real and excess returns (proxy hypothesis, tighter policy, higher volatility); weak out of sample",
+   "citations": ["Fama and Schwert 1977 JFE", "Fama 1981 AER", "Welch and Goyal 2008 RFS"]
+  },
+  {
+   "id": "C07", "short": "SLOOS", "name": "Net share of banks tightening C&I lending standards", "sign": -1, "in_composite": true,
+   "definition": "FRED DRTSCILM from the latest observation usable at t, held constant between releases; an observation dated at the start of quarter q is usable from the last session of the first month after quarter q ends (e.g. 1990-04-01 usable from 1990-07-31)",
+   "sources": ["FRED DRTSCILM (from 1990-04-01; ALFRED vintages from 2010-04-20)"],
+   "history_from": "1990-04-01 (first usable 1990-07-31)",
+   "lag": "conservative rule above; QA: for observations whose first ALFRED vintage is within 120 days of the observation date, the usable date must be >= that vintage date, else all usable dates move one month later",
+   "exposure": "clean apart from general knowledge; the returns paper's sample includes 2008",
+   "ta_flag": "none (survey)",
+   "rationale": "Tightening credit supply precedes slower lending and output; tighter standards predict lower aggregate returns at one quarter to a year",
+   "citations": ["Lown and Morgan 2006 JMCB", "Bassett, Chosak, Driscoll and Zakrajsek 2014 JME", "Chava, Gallmeyer and Park 2015 JME"]
+  },
+  {
+   "id": "C08", "short": "CLAIMS", "name": "Initial jobless claims, year on year", "sign": -1, "in_composite": true,
+   "definition": "w = latest week-ending Saturday with w + 5 days <= t; ln(sum ICNSA weeks w-3..w) - ln(sum ICNSA weeks w-55..w-52)",
+   "sources": ["FRED ICNSA (NSA, from 1967-01-07; latest vintage; ALFRED only from 2009)"],
+   "history_from": "1967-01-07",
+   "lag": "5 days after week end (Thursday release); one small advance revision accepted",
+   "exposure": "2008 and 2020 spikes known; 2020 capped by the composite clip",
+   "ta_flag": "none",
+   "rationale": "Timeliest hard labour series and a leading indicator; rising layoffs mark recession onsets where drawdowns and volatility concentrate; weak and state-dependent prior",
+   "citations": ["Stock and Watson 1989 NBER Macro Annual", "Boyd, Hu and Jagannathan 2005 JF"]
+  },
+  {
+   "id": "C09", "short": "ECY", "name": "Excess CAPE yield", "sign": 1, "in_composite": true,
+   "definition": "q = backtest_rating.reported_quarter(t); m = latest CPIAUCNS month in the vintage at t; CAPE = (P(t-)/CPI_m) / mean over k=q-119..q of (E_k/CPI_k); RR10 = DGS10(t-)/100 - ((CPI_m/CPI_{m-120})^(1/10) - 1); ECY = 1/CAPE - RR10; P = ^GSPC close; E = Shiller trailing 12-month earnings; Shiller's own CAPE / ECY columns not used; level only",
+   "sources": ["Shiller E (pinned pickle, from output/backtest/ie_data.xls)", "Yahoo ^GSPC", "FRED DGS10", "FRED/ALFRED CPIAUCNS"],
+   "history_from": "1881 (Shiller); all inputs available from 1990",
+   "lag": "earnings: last reported quarter (quarter end + 2 months); CPI: vintage at t; price and yield: t-",
+   "exposure": "partial: valuation drift added no 6-month skill; valuation term added nothing 1881-2026; 2010s known",
+   "ta_flag": "valuation level only (allowed); changes forbidden",
+   "rationale": "Cheap equities relative to real bond yields should earn more; strong at 5-10 years, weak at 1-6 months; valuation baseline with low prior",
+   "citations": ["Campbell and Shiller 1988 RFS/JF", "Campbell and Shiller 1998 JPM", "Asness 2003 JPM"]
+  },
+  {
+   "id": "C10", "short": "IVAR", "name": "Implied variance (VIX squared)", "sign": -1, "in_composite": false,
+   "definition": "(VIX(t-)/100)^2",
+   "sources": ["Yahoo ^VIX (pinned pickle)"],
+   "history_from": "1990-01-02",
+   "lag": "t-",
+   "exposure": "NOT CLEAN: VIX spikes followed by rebounds seen; hurdle (mostly VIX) seen to have no timing value",
+   "ta_flag": "none (option-implied)",
+   "rationale": "3x fund log growth loses about 3x index variance per year; premium does not rise in proportion to variance, so high implied variance should mark worse typical SPXL outcomes; sign contested (Martin 2017)",
+   "citations": ["French, Schwert and Stambaugh 1987 JFE", "Glosten, Jagannathan and Runkle 1993 JF", "Martin 2017 QJE", "Cheng and Madhavan 2009"]
+  },
+  {
+   "id": "C11", "short": "HURDLE", "name": "Leverage-cost hurdle (spxlcast/assess.py)", "sign": -1, "in_composite": false,
+   "definition": "column hurdle of the pinned rating_backtest.csv at origin t: exp((fees + 2*(3m bill + 0.75%))/3 + 1.5*sigma_1y^2) - 1 via spxlcast.assess.leverage_cost",
+   "sources": ["pinned output/backtest/rating_backtest.csv"],
+   "history_from": "1990-01-31",
+   "lag": "data dated t, as in the backtest",
+   "exposure": "NOT CLEAN: full-sample tercile results and (per brief) rank correlation about -0.03 seen",
+   "ta_flag": "none",
+   "rationale": "Model's own cost measure; higher hurdle should mark worse times to hold SPXL; in excess returns it is in effect a volatility measure",
+   "citations": ["README.md", "spxlcast/assess.py"]
+  },
+  {
+   "id": "C12", "short": "SCORE", "name": "Retired rating score (spxlcast/rating.py)", "sign": 1, "in_composite": false,
+   "definition": "column score of the pinned rating_backtest.csv at origin t: mean of clip(annualised 6-month median excess return / 15%) and clip(annualised Sharpe-like ratio / 0.5), full model, no news",
+   "sources": ["pinned output/backtest/rating_backtest.csv"],
+   "history_from": "1990-01-31",
+   "lag": "data dated t, as in the backtest",
+   "exposure": "NOT CLEAN: full-sample 6-month rank correlation -0.03 and half-sample threshold behaviour seen",
+   "ta_flag": "none",
+   "rationale": "The model's intended direction",
+   "citations": ["README.md", "spxlcast/rating.py"]
+  }
+ ],
+ "composite": {
+  "id": "COMP", "sign": 1,
+  "members": ["C01", "C02", "C03", "C04", "C05", "C06", "C07", "C08", "C09"],
+  "z": "(x_jt - mu_j) / sd_j; mu_j, sd_j (ddof=1) over parameter-window month-ends where x_j is available",
+  "formula": "mean over available members of clip(s_j * z_jt, -3, 3)",
+  "min_members": 7,
+  "weights": "equal, fixed now; no fitting, no dropping after the freeze"
+ },
+ "train_sets": {
+  "from_predictor_values_at_parameter_window_only": ["mu_j, sd_j for C01-C09 (reported for C10-C12)", "tau = 33.33rd percentile (numpy linear) of COMP", "tau_j = 33.33rd percentile of s_j*x_j per candidate (secondary economic table)", "c = median IVAR; w_bar = mean of min(1, c/IVAR)", "SLOOS lag QA branch", "SHA-256 of output/research/predictor_inputs.pkl and output/research/train_params.json"],
+  "train_outcome_statistics": "computed and reported as replication only; may not change anything",
+  "fixed_now": ["candidates, definitions, sources, lags", "signs", "composite members, weights, clip", "targets, horizons, split", "statistic, inference, correction, alpha", "economic rule, costs, pass criteria", "sanity checks and reports"]
+ },
+ "primary_test": {
+  "predictors": ["C01", "C02", "C03", "C04", "C05", "C06", "C07", "C08", "C09", "C10", "C11", "C12", "COMP"],
+  "K": 13,
+  "target": "Y", "h": 126, "sample": "test origins where predictor and target are available",
+  "statistic": "r = spxlcast.evaluation.spearman(s_P * P_t, Y(t,126))",
+  "n_eff": "spxlcast.evaluation.effective_n(session positions of the sample's origins, 126)",
+  "z": "atanh(r) * sqrt(n_eff - 3) / sqrt(1 + r^2/2)",
+  "p_one_sided": "1 - Phi(z); p = 1 if r undefined or n_eff <= 4",
+  "interval_reported": "backtest_rating._corr_ci(r, n_eff), 90%",
+  "correction": "Holm step-down, family-wise alpha 0.05 over K = 13",
+  "pass": "hypothesis rejected by Holm",
+  "power_calendar_based": {"h126_n_eff": 37.1, "min_r_unadjusted": 0.28, "min_r_first_holm_step": 0.45, "power_unadjusted_rho_0.1_0.2_0.3": [0.14, 0.32, 0.55], "power_first_holm_step_rho_0.1_0.2_0.3": [0.02, 0.07, 0.18], "min_r_first_holm_step_h63": 0.31, "min_r_first_holm_step_h21": 0.18}
+ },
+ "secondary_tests": {
+  "families": [
+   {"id": "F2", "target": "Y", "h": 21, "direction": "r > 0"},
+   {"id": "F3", "target": "Y", "h": 63, "direction": "r > 0"},
+   {"id": "F4", "target": "S", "h": 126, "direction": "r > 0"},
+   {"id": "F5", "target": "S", "h": 63, "direction": "r > 0"},
+   {"id": "F6", "target": "S", "h": 21, "direction": "r > 0"},
+   {"id": "F7", "target": "-D20", "h": 63, "direction": "r > 0 against -D20 (favourable predicts fewer dips)"}
+  ],
+  "correction": "Holm within each family of 13",
+  "status": "reported, never decisive",
+  "replication": "primary test and F2-F7 on train origins, labelled published-sample replication"
+ },
+ "economic_test": {
+  "rule": "at each test origin 2008-01-31..2026-07-31 hold the realised fund (SPXL) from close t to the next month-end close if COMP_t >= tau, else T-bills (tbill_ret); last holding ends 2026-08-31 close; 223 monthly holdings, sessions 2008-02-01..2026-08-31",
+  "switch_cost": "0.10% of portfolio per switch, charged on the first day of the new holding",
+  "missing_signal": "keep previous position; count reported",
+  "benchmarks": {
+   "BH": "buy-and-hold realised fund, same sessions, no cost",
+   "MIX_w": "w SPXL + (1-w) T-bills rebalanced monthly, w = rule's fraction of the 223 months in SPXL, cost 0.10% x |weight traded|"
+  },
+  "metrics": {
+   "CAGR": "W_end^(252/N) - 1, N sessions",
+   "Sharpe": "mean/sd of daily (return - tbill_ret) x sqrt(252)",
+   "max_drawdown": "max over days of 1 - W_t / running max W"
+  },
+  "pass_all_of": {
+   "E1": "CAGR(rule) > CAGR(BH) and CAGR(rule) > CAGR(MIX_w)",
+   "E2": "Sharpe(rule) > Sharpe(BH) and Sharpe(rule) > Sharpe(MIX_w)",
+   "E3": "max_drawdown(rule) < max_drawdown(BH)",
+   "E4": "Sharpe(rule) > Sharpe(BH) within sessions 2008-02-01..2016-12-30 and within 2017-01-03..2026-08-31"
+  },
+  "also_applied_to": "every candidate passing the primary test, with its own tau_j (same criteria); all 12 candidates reported as a secondary table",
+  "secondary_descriptive": [
+   "composite rule with 0 and 25 bp switching costs, and with threshold at the train median",
+   "stationary bootstrap (Politis-Romano) 90% intervals for Sharpe and CAGR differences vs BH: paired monthly holding-period returns, mean block 6 months, 10000 resamples, seed 20260927",
+   "vol-managed exposure w_t = min(1, c/IVAR_t), rest T-bills, monthly, 0.10% x |weight traded|, vs BH and constant w_bar (not clean: VIX level)",
+   "time in SPXL, switches, turnover, total costs"
+  ]
+ },
+ "verdict": [
+  {"condition": "primary Holm pass AND economic pass", "label": "Timing signal confirmed", "qualifiers": {"C10, C11, C12": "not a clean out-of-sample test", "C01, C09": "partly exposed"}},
+  {"condition": "primary Holm pass, economic fail", "label": "Predictive, not usable by the registered rule"},
+  {"condition": "composite economic pass, no primary pass", "label": "Not confirmed (gain could be luck); candidate for a new pre-registration on future data only"},
+  {"condition": "neither", "label": "No timing signal found"}
+ ],
+ "robustness_labels": {
+  "episode-dependent": "one-sided p > 0.10 when any one episode's origins are left out",
+  "one half only": "r not positive in both halves (origins 2008-01..2016-12 and 2017-01..2026-02)"
+ },
+ "sanity_checks": [
+  "seal: no outcome window ending after 2007-12-31 loaded before Test (code guard + unit test)",
+  "pinned hashes match; predictor_inputs.pkl and train_params.json match TRAIN_REPORT.md",
+  "point in time: truncation invariance at 20 train month-ends per candidate; synthetic unit tests for CPI and INDPRO vintages, SLOOS usable date, claims Thursday rule, Shiller earnings lag",
+  "target reproduction vs pinned CSV (excess_h, sp_h - tbill_h, real_dd20_63), tolerance 1e-9: train origins in Train phase (read through the seal), all origins in Test phase",
+  "legacy reproduction (Test): score full-sample 6-month Spearman = -0.03 +/- 0.01, else fix as deviation before interpreting",
+  "synthetic fund vs SPXL daily correlation >= 0.99 where both exist",
+  "coverage of every candidate and COMP at train and test origins (expected >= 95%; SLOOS from 1990-07); test coverage < 90% flags that test",
+  "standardisation: mu_j, sd_j reported, no zero sd; members available per month",
+  "descriptives and plots of predictors (train only until unsealed)",
+  "TA diagnostic: train-period Spearman of each candidate and COMP with trailing 1/3/6/12-month S&P 500 price return (reported only)",
+  "collinearity: train-period Spearman matrix of the 12 candidates",
+  "robustness (Test): halves; leave out origins 2008-01..2009-06, 2019-09..2020-06, 2021-07..2022-12 in turn; moving-block bootstrap 90% interval for r (blocks of 12 origins, 10000, seed 20260927); COMP with expanding-window z (from 1990-01, minimum 60 months); partial Spearman of passing predictors controlling for ln VIX(t-) and DGS3MO(t-); synthetic spread 0.25% and 1.25%",
+  "look log: every run appends UTC time, phase, command, spec hashes and git describe --always --dirty to output/research/look_log.csv"
+ ],
+ "always_reported": "research/RESULTS.md and output/research/test/*: 13 primary tests (r, n, n_eff, 90% interval, raw and Holm p, pass/fail); F2-F7; train replication; composite economic test with benchmarks and E1-E4; secondary economic tables; all sanity checks; deviations; look-log summary; verdict in the registered words, including 'No timing signal found'",
+ "phases": {
+  "0_freeze": "research/PREREGISTRATION.md, research/prereg.json, research/PREREG_HASH.txt",
+  "1_build": "scripts/research_signals.py (build, train, test) and tests/test_research_seal.py, tests/test_research_pit.py, tests/test_research_stats.py; no outcomes loaded",
+  "2_train": "download predictor_inputs.pkl; build all predictors; set train quantities; train-side checks and replication; write output/research/train_params.json and research/TRAIN_REPORT.md with both hashes",
+  "3_test": "py scripts/research_signals.py test --unseal <SHA-256 of research/PREREGISTRATION.md>; run once"
+ },
+ "code_guard": "outcome loader truncates the daily frame at 2007-12-31 before any outcome is computed unless unsealed; unseal requires token == SHA-256 of PREREGISTRATION.md, both file hashes match PREREG_HASH.txt, train_params.json exists and matches TRAIN_REPORT.md; legacy predictor loader reads only date, pos, hurdle, score and checks the pinned hash; CSV outcome columns only via the target-reproduction check through the same seal",
+ "deviation_policy": "record in research/DEVIATIONS.md with reason, date, before/after unsealing; before unsealing only data or code reasons, never train results; after unsealing only bug fixes, reporting original and corrected results; an unbuildable candidate is 'not tested', K stays 13, p = 1",
+ "excluded": {
+  "oil price change": "price momentum of a commodity (owner's no-momentum rule, read conservatively)",
+  "credit spread change, GZ EBP change": "moves with past equity returns; EBP not point in time",
+  "relative bill rate (rate minus 12-month average)": "replaced by 12-month change to avoid a moving-average construct",
+  "BAA10Y": "mixes credit and maturity; Baa-Aaa is canonical",
+  "NFCI, ANFCI, STLFSI, KCFSI": "full-sample re-estimation; equity inputs",
+  "cay": "recursive DOLS on NIPA/Z.1 vintages; stale; wealth moves with equity prices",
+  "AAII, put/call": "licence/approval; price-chasing, close to TA",
+  "UMich sentiment": "weak prior for S&P 500",
+  "Sahm real-time": "designed 2019 with hindsight; overlaps C08; inside tested drift",
+  "VIX3M/VIX6M slope, VVIX, implied correlation": "start 2006-2007; no training data",
+  "ICE BofA HY OAS": "FRED API serves about 3 years",
+  "TED, ISM PMI, OECD CLI": "discontinued, not on FRED, or embeds share prices",
+  "short interest, net payout yield": "no free point-in-time data",
+  "SKEW, calendar and FOMC-cycle effects": "weak prior or decayed",
+  "HAR ex-ante VRP, realised-variance scaling": "one definition per idea; realised variance only inside C01"
+ }
+}

@@ -23,7 +23,14 @@ FRI_1559 = datetime(2026, 9, 25, 19, 59, 30, tzinfo=UTC)       # Friday 15:59:30
 SAT_NOON = datetime(2026, 9, 26, 16, 0, tzinfo=UTC)            # Saturday 12:00 ET
 
 
-def _base(spot=100.0, run_at="2026-09-25T17:40:00.218019+00:00", levels=(80.0, 90.0), label="HOLD", seed=0):
+def _assessment(leverage="normal", drawdown="normal", spot=100.0):
+    return {"leverage": {"hurdle": 0.068, "level": leverage, "percentile": 48.0},
+            "drawdown": {"p_dip20_3m": 0.24, "level": drawdown, "history_real": 0.22, "history_n": 143},
+            "range_3m": {"p5": 0.7 * spot, "median": 0.98 * spot, "p95": 1.3 * spot}, "horizon_days": 63}
+
+
+def _base(spot=100.0, run_at="2026-09-25T17:40:00.218019+00:00", levels=(80.0, 90.0), label="HOLD", seed=0,
+          assessment=None):
     """A stored forecast in the shape forecast_to_dict writes. Like the simulator's, the path min/max
     samples hold a point mass exactly at the spot (paths that never trade below / above the start)."""
     rng = np.random.default_rng(seed)
@@ -45,6 +52,7 @@ def _base(spot=100.0, run_at="2026-09-25T17:40:00.218019+00:00", levels=(80.0, 9
     return {
         "run_at": run_at, "etf": "SPXL", "spot": spot, "spot_status": "intraday",
         "rating": {"label": label, "conviction": "Low", "score": 0.14, "score_se": 0.02, "horizon_days": 126},
+        "assessment": assessment,
         "forecast": forecast,
         "price_lookup": {f"{p:.1f}": [] for p in levels},
         "limit_ladder": {"126": [{"p_fill": 0.5, "price": 85.0, "vs_spot": -0.15}]},
@@ -194,13 +202,13 @@ def test_header_links_only_for_files_that_exist(tmp_path, site):
 
 def test_bad_live_json_drops_only_the_live_block(site):
     good = _live_doc()
-    no_rating = {k: v for k, v in good.items() if k != "rating"}
-    null_score = {**good, "rating": {**good["rating"], "score": None}}
+    no_spot = {k: v for k, v in good.items() if k != "spot"}
+    null_change = {**good, "change_vs_base": None}
     naive_asof = {**good, "asof": "2026-09-25T19:59:30"}
     h = next(iter(good["horizons"]))
     no_q5 = json.loads(json.dumps(good))
     del no_q5["horizons"][h]["quantile_prices"]["5.0"]
-    for doc in ([], {}, "text", no_rating, null_score, no_q5, {**good, "horizons": [1, 2]}):
+    for doc in ([], {}, "text", no_spot, null_change, no_q5, {**good, "horizons": [1, 2]}):
         _write(site.path("output", "live.json"), json.dumps(doc))
         assert render_live(site.path("output", "live.json"), now=SAT_NOON) == ""
         status, _, body = site.request("/")
@@ -306,15 +314,19 @@ def test_settle_marks_the_close_and_rebases_on_a_new_run(tmp_path):
     before = lj.read_bytes()
     assert settle_closed(root) is None and lj.read_bytes() == before
 
-    # the after-close run lands: restated at its own spot and time, with its rating
-    _write(str(fc), json.dumps(_base(spot=105.0, run_at="2026-09-25T21:40:21.5+00:00", label="BUY")))
+    # the after-close run lands: restated at its own spot and time, with its assessment
+    _write(str(fc), json.dumps(_base(spot=105.0, run_at="2026-09-25T21:40:21.5+00:00", label="BUY",
+                                     assessment=_assessment("high", "elevated", spot=105.0))))
     assert settle_closed(root) is not None
     rebased = json.loads(lj.read_text(encoding="utf-8"))
     assert rebased["base_run_at"] == "2026-09-25T21:40:21Z" and rebased["spot"] == 105.0
-    assert rebased["rating"]["label"] == "BUY" and rebased["session_open"] is False
+    assert rebased["rating"]["label"] == "BUY" and rebased["session_open"] is False     # logged, not shown
+    assert rebased["assessment"]["leverage"]["level"] == "high" and rebased["assessment"]["range_3m"]["p95"] == 1.3 * 105.0
     assert rebased["asof"] == "2026-09-25T21:40:21+00:00" and rebased["change_vs_base"] == 0.0
     block = render_live(str(lj), now=SAT_NOON)
-    assert "market closed" in block and ">BUY<" in block and "+0.00% since the full run at 105.00" in block
+    assert "market closed" in block and "+0.00% since the full run at 105.00" in block
+    assert 'leverage cost <b class="lvl">high</b>' in block and 'drawdown risk <b class="lvl">elevated</b>' in block
+    assert "BUY" not in block and "rating" not in block
     rows = list(csv.DictReader(open(tmp_path / "logs" / "spot_log.csv", encoding="utf-8")))
     assert len(rows) == 1                                 # settling never logs a price row
 

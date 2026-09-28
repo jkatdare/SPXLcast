@@ -11,11 +11,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .assess import DIP_HORIZON, DRAWDOWN_LEVELS, LEVERAGE_LEVELS, NA
 from .config import MARKET_TICKERS
 from .pipeline import Forecast
 from .tracklog import MIN_INDEPENDENT
-
-RATING_STYLE = {"BUY": "bold green", "HOLD": "bold yellow", "SELL": "bold red"}
 
 
 def pct(x: Optional[float], digits: int = 1, sign: bool = True) -> str:
@@ -60,16 +59,99 @@ def render_header(fc: Forecast, console: Console) -> None:
         console.print("[dim]The session is open: the spot, VIX and yields are live quotes, not closes.[/dim]")
 
 
-def render_rating(fc: Forecast, console: Console) -> None:
-    r = fc.rating
-    style = RATING_STYLE.get(r.label, "bold")
-    body = Text()
-    body.append(f"{r.label}", style=style)
-    body.append(f"   conviction {r.conviction.lower()}   score {r.score:+.2f} (+/- {r.score_se:.2f} Monte Carlo)   "
-                f"horizon {horizon_label(r.horizon)} ({r.horizon} trading days)\n\n")
-    for reason in r.reasons:
-        body.append(f" - {reason}\n")
-    console.print(Panel(body, title="Rating", box=box.ROUNDED, border_style=style.split()[-1]))
+def _span(period: Optional[str]) -> str:
+    """'1990-01..2026-08' -> 'from 1990 to 2026'."""
+    try:
+        a, b = str(period).split("..")
+        return f"from {int(a[:4])} to {int(b[:4])}"
+    except (TypeError, ValueError):
+        return "in the backtest"
+
+
+def render_assessment(fc: Forecast, console: Console) -> None:
+    """Leverage cost, drawdown risk and the 3-month range, in plain words (see assess.py)."""
+    a = fc.assessment
+    if a is None:
+        console.print("[dim]No assessment for this run.[/dim]")
+        return
+    lc, dd, span, L = a.leverage, a.drawdown, _span(a.period), fc.etf.leverage
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold", no_wrap=True)
+    grid.add_column()
+
+    def level(name: str, value: str) -> None:
+        grid.add_row(name, Text(value, style="bold cyan" if value != NA else "dim"))
+
+    def where(percentile: Optional[float], value: str, labels, ends) -> None:
+        if percentile is not None and value in labels:
+            i = labels.index(value)
+            n = min(max(round(percentile), (0, 34, 67)[i]), (33, 66, 100)[i])   # rounding stays inside the third
+            grid.add_row("", f"That is higher than in {n}% of the months {span} (low = the {ends[0]} third of those "
+                             f"months, {labels[2]} = the {ends[1]} third).")
+
+    total = lc.financing + lc.fees + lc.drag
+    level("Leverage cost", lc.level)
+    grid.add_row("", f"The S&P 500 has to return {pct(lc.hurdle, 1, False)} a year on average, dividends included, "
+                     f"for SPXL just to break even over the long run.")
+    where(lc.percentile, lc.level, LEVERAGE_LEVELS, ("cheapest", "costliest"))
+    grid.add_row("", f"Compared with {L:.0f} times the S&P 500's return, SPXL gives up about {pct(total, 1, False)} a "
+                     f"year: borrowing {pct(lc.financing, 1, False)} (it borrows {L - 1:.0f} times its own value and pays "
+                     f"the 3-month Treasury bill rate, {pct(fc.macro.rf_3m, 2, False)}, plus {fc.cfg.swap_spread:.2%} on "
+                     f"it), fees {pct(lc.fees, 2, False)}, and volatility drag {pct(lc.drag, 1, False)} (SPXL resets to "
+                     f"{L:.0f}x every day, which loses money when the market zigzags: the bigger the swings, the bigger "
+                     f"the loss. The model expects the S&P 500 to swing about {pct(lc.sigma, 0, False)} a year).")
+    grid.add_row("", f"The S&P 500 has to make up only about a third of that ({pct(total / L, 1, False)}), plus a "
+                     f"little for its own swings: hence the {pct(lc.hurdle, 1, False)}.")
+    grid.add_row("", f"For comparison: the model's long-run S&P 500 estimate is {pct(lc.expected_index_return)} a year. "
+                     f"It is an average over many years, not a forecast for the coming months, and since 1990 it has "
+                     f"run below what the S&P 500 actually returned.")
+    grid.add_row("", "")
+
+    level("Drawdown risk", dd.level)
+    if math.isfinite(dd.p_dip20_3m):
+        grid.add_row("", f"{pct(dd.p_dip20_3m, 0, False)} chance SPXL closes at or below {fc.spot * 0.8:,.2f}, a fall "
+                         f"of 20% or more from {fc.spot:,.2f}, on some day in the next 3 months (even if it recovers "
+                         f"afterwards).")
+        where(dd.percentile, dd.level, DRAWDOWN_LEVELS, ("calmest", "riskiest"))
+        if dd.history_real is not None and dd.history_pred is not None and dd.history_n:
+            grid.add_row("", f"In the backtest's {dd.history_n} months at this level {span}, the model would have said "
+                             f"{pct(dd.history_pred, 0, False)} on average, and such a fall followed "
+                             f"{pct(dd.history_real, 0, False)} of the time. Before 2009 these use a 3x fund rebuilt from "
+                             f"the S&P 500, as SPXL did not exist yet; and neighbouring months share most of their 3 "
+                             f"months, so there are fewer separate cases than months.")
+    grid.add_row("", "")
+
+    if a.range_3m is not None:
+        lo, mid, hi = a.range_3m
+        grid.add_row("3-month range", f"In 3 months SPXL ends between {lo:,.2f} and {hi:,.2f} in 90% of the model's "
+                                      f"simulations (5% end lower, 5% higher); the typical (middle) outcome is "
+                                      f"{mid:,.2f}. In the 1990-2026 backtest, ranges like this held about 9 times in 10.")
+    else:
+        grid.add_row("3-month range", Text("n/a", style="dim"))
+    grid.add_row("", "")
+    grid.add_row("", Text("This is not a buy or sell signal. In the 1990-2026 backtest, months at high leverage cost or "
+                          "elevated drawdown risk were not followed by lower returns on average (elevated risk did bring "
+                          "more 20% falls), and the months the old buy/hold/sell rating marked as a buy did no better than "
+                          "the rest, which is why it is no longer shown.", style="dim"))
+    for n in a.notes:
+        grid.add_row("", Text(f"note: {n}", style="yellow"))
+    console.print(Panel(grid, title="Assessment", box=box.ROUNDED))
+
+
+def quiet_summary(fc: Forecast) -> str:
+    """The assessment in one line (``--quiet`` and ``log``)."""
+    a = fc.assessment
+    if a is None:
+        return "no assessment for this run"
+    lc, dd = a.leverage, a.drawdown
+    parts = [f"leverage cost {lc.level} (the S&P 500 needs {pct(lc.hurdle, 1, False)}/yr for SPXL to break even "
+             f"over the long run)"]
+    parts.append(f"drawdown risk {dd.level}" + (f" ({dd.p_dip20_3m:.0%} chance of a fall of 20% or more within 3 months)"
+                                                if math.isfinite(dd.p_dip20_3m) else ""))
+    if a.range_3m is not None:
+        lo, mid, hi = a.range_3m
+        parts.append(f"3-month range {lo:,.2f} to {hi:,.2f} (90% of outcomes), typical {mid:,.2f}")
+    return "; ".join(parts)
 
 
 def render_forecast(fc: Forecast, console: Console) -> None:
@@ -169,11 +251,13 @@ def render_drivers(fc: Forecast, console: Console) -> None:
     t.add_row("Expense ratio", pct(etf.expense_ratio, 2, False), "")
     t.add_row("Financing cost", pct(etf.financing_rate, 2, False),
               f"({etf.leverage - 1:.0f}x) x (3m bill + {fc.cfg.swap_spread:.2%} all-in spread)")
-    t.add_row("Volatility decay", pct(etf.theoretical_drag(sig), 1, False),
-              "L(L-1)/2 x sigma^2 at the horizon vol (emerges in the simulation)")
+    t.add_row(f"Volatility drag to {horizon_label(hr)}", pct(etf.theoretical_drag(sig), 1, False),
+              f"L(L-1)/2 x sigma^2 at the {horizon_label(hr)} vol (emerges in the simulation); the assessment's figure "
+              f"uses the 1-year vol")
     sig_1y = v.one_year_vol if v.one_year_vol is not None else v.total_vol(min(252, len(v.daily)))
     t.add_row("Break-even index return", pct(etf.breakeven_index_return(sig_1y), 1, False),
-              "arithmetic index return at which SPXL's median is flat over a year (at the 1-year vol)")
+              "the leverage-cost hurdle: average index return at which SPXL's long-run (log) growth is zero, at the "
+              "1-year vol; the simulated 1-year median sits higher, because volatility comes in bursts")
     if etf.calibration:
         c = etf.calibration
         t.add_row("Realised beta / R2", f"{c.beta:.2f} / {c.r2:.3f}",
@@ -366,15 +450,27 @@ def render_score(rep, console: Console, path: str) -> None:
                   f"many observations and appear once there are {MIN_INDEPENDENT}; until then the numbers are "
                   "anecdotes, not evidence. Fine = the run's 103-point grid from the archive; coarse = the 9 logged "
                   "quantiles.[/dim]")
-    if rep.by_rating:
-        t = Table(title="Realised return at the rating horizon, by rating given", box=box.SIMPLE)
-        for c in ("Rating", "n", "Mean realised return", "P(positive)"):
+    if rep.by_drawdown_risk:
+        def share(x) -> str:
+            return f"{x:.0%}" if x is not None and math.isfinite(x) else "n/a"
+
+        t = Table(title=f"Drawdown risk check: how often a 20% fall within 3 months ({DIP_HORIZON} sessions) followed, "
+                        f"by the level the page showed [90% interval]", box=box.SIMPLE)
+        for c in ("Drawdown risk", "n", "Indep.", "Predicted", "Happened", "Backtest predicted / happened"):
             t.add_column(c, justify="right")
-        for label in ("BUY", "HOLD", "SELL"):
-            if label in rep.by_rating:
-                r = rep.by_rating[label]
-                t.add_row(label, str(r["n"]), pct(r["mean_return"]), pct(r["p_positive"], 0, False))
+        for label in DRAWDOWN_LEVELS:
+            if label in rep.by_drawdown_risk:
+                r = rep.by_drawdown_risk[label]
+                t.add_row(label, str(r["n"]), f"{r['n_eff']:.1f}", share(r["pred"]),
+                          f"{share(r['real'])} {ci(r['real_ci'], '{:.0%}')}",
+                          f"{share(r['backtest_pred'])} / {share(r['backtest_real'])}")
         console.print(t)
+        console.print("[dim]Level = the drawdown risk the page showed; rows logged before it existed are placed by their "
+                      "logged 3-month dip chance. Happened = SPXL closed 20% or more below the logged price within 3 "
+                      "months. Backtest = the same at that level over the 1990-2026 month-ends. The bracket shows how "
+                      "far 'Happened' could be from the true rate with this few separate 3-month windows (Indep.); "
+                      "while it is wide, the live record neither confirms nor contradicts the page, and the backtest "
+                      "column is the long-run check.[/dim]")
     _render_sentiment_score(rep, console)
 
 
@@ -393,12 +489,12 @@ def render_notes(fc: Forecast, console: Console) -> None:
 
 def render_all(fc: Forecast, console: Console, prices: Optional[List[float]] = None,
                sections: Optional[Iterable[str]] = None) -> None:
-    sections = set(sections) if sections else {"header", "rating", "forecast", "price", "ladder", "drivers",
+    sections = set(sections) if sections else {"header", "assessment", "forecast", "price", "ladder", "drivers",
                                                 "metrics", "sensitivity", "news", "notes"}
     if "header" in sections:
         render_header(fc, console)
-    if "rating" in sections:
-        render_rating(fc, console)
+    if "assessment" in sections:
+        render_assessment(fc, console)
     if "forecast" in sections:
         render_forecast(fc, console)
     if "price" in sections and prices:

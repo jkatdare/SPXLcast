@@ -1,0 +1,696 @@
+{
+ "title": "SPXL timing-signal search: frozen test specification",
+ "version": "1.0",
+ "status": "Frozen at the end of the Train phase, before unsealing. The Test phase takes every number it needs from this file and changes none of them.",
+ "governing_document": "research/PREREGISTRATION.md governs (research/prereg.json is its machine-readable copy). This file adds the quantities section 8 lets the Train phase set and fixes, before unsealing, the implementation details the plan leaves open ('interpretations').",
+ "hash_file": "research/FROZEN_HASH.txt (SHA-256 of this file's bytes); the same bytes are output/research/train_params.json, whose SHA-256 research/TRAIN_REPORT.md records",
+ "prereg": {
+  "research/PREREGISTRATION.md": "6452feeec9c43727f38eeff29322e7a4e075cf60863af5c7591081913d0c237b",
+  "research/prereg.json": "696a8939bcb4e8b8492a2094066c738136314006d599b407bff3c4ed8b42b785",
+  "frozen_utc": "2026-09-27T16:49:20Z",
+  "unseal_token": "the SHA-256 of research/PREREGISTRATION.md above"
+ },
+ "inputs": {
+  "pinned_sha256": {
+   "output/backtest/rating_inputs.pkl": "d21e55055f35d91e5084f336b115b6dedcd99e8819598a1a15544851084d868e",
+   "output/backtest/rating_backtest.csv": "a272f0cadabefc75f1c88d4026444c3961cd9ce490f75ee65a763968c2fb4be4",
+   "output/backtest/ie_data.xls": "044196dafe44c3030b2facbdea023975b3f6aa68b4e52f8f9bafc403e19589c1"
+  },
+  "predictor_inputs_sha256": {
+   "output/research/predictor_inputs.pkl": "133e9d8692620fdc992a31c529bdc456c1dca5fde907f9955734793cf55b5560"
+  },
+  "train_panel_sha256": {
+   "output/research/panel_train.pkl": "52c51026367d3baf5932d753d5c1b85799c800b7a67241989e9b02eeff7486e3"
+  },
+  "note": "on a mismatch of a pinned or predictor-input hash the Test phase stops. The train quantities were computed from panel_train.pkl above. panel_test.pkl was not opened or hashed by the Train phase; the Test phase uses the panel built by `build` from the inputs above (if it rebuilds it with `build --offline`, the rebuilt panel_train.pkl must match the hash above). The code and panel_meta.json hashes at train time are in research/train_results.md (provenance only)"
+ },
+ "calendar": {
+  "sessions": "trading days of scripts/backtest_rating.build_daily(inputs, Config()) from the pinned rating_inputs.pkl (^SP500TR calendar)",
+  "origin": "last session of each calendar month (backtest_rating.month_end_positions), 1990-01-31..2026-08-31",
+  "t_minus": "the session immediately before the origin; daily market inputs of C01-C10 use values dated on or before t-; C11 and C12 use data dated t as in the backtest",
+  "stale_daily_limit_sessions": 5,
+  "position": "decision at origin t implemented at the close of t; outcome window sessions t+1..t+h",
+  "data_cutoff": "2026-09-25",
+  "split": {
+   "train_origins": "month-ends from 1990-01-31 whose window's last session <= 2007-12-31",
+   "test_origins": "month-ends from 2008-01-31 whose window's last session <= 2026-09-25",
+   "embargo": "origins between the two belong to neither",
+   "parameter_window": "month-ends 1990-01-31..2007-06-29 (predictor values only)",
+   "expected_from_calendar": {
+    "h126": {
+     "train": [
+      "1990-01-31",
+      "2007-06-29",
+      210,
+      35.8
+     ],
+     "test": [
+      "2008-01-31",
+      "2026-02-27",
+      218,
+      37.1
+     ]
+    },
+    "h63": {
+     "train": [
+      "1990-01-31",
+      "2007-09-28",
+      213,
+      71.7
+     ],
+     "test": [
+      "2008-01-31",
+      "2026-05-29",
+      221,
+      74.2
+     ]
+    },
+    "h21": {
+     "train": [
+      "1990-01-31",
+      "2007-10-31",
+      214,
+      209.2
+     ],
+     "test": [
+      "2008-01-31",
+      "2026-07-31",
+      223,
+      218.2
+     ]
+    },
+    "format": "[first origin, last origin, count, effective_n]"
+   }
+  },
+  "test_origin_rule": "month-end origins from 2008-01-31 whose h-session window's last session is on or before 2026-09-25 (h = 126 for the primary test and F4; 63 for F3, F5, F7; 21 for F2, F6)"
+ },
+ "targets": {
+  "definitions": {
+   "R_bill": "prod over i=t+1..t+h of (1 + tbill_ret_i) - 1; tbill_ret = previous day's DGS3MO / 252 (build_daily)",
+   "Y": "fund[t+h]/fund[t] - 1 - R_bill(t,h); fund = synthetic 3x through 2008-12-31, SPXL from 2009-01-02 (backtest excess_h)",
+   "S": "tr[t+h]/tr[t] - 1 - R_bill(t,h); tr = ^SP500TR (backtest sp_h - tbill_h)",
+   "D20": "1 if min over i=t+1..t+63 of fund[i]/fund[t] <= 0.8 else 0 (backtest real_dd20_63)"
+  },
+  "primary": {
+   "target": "Y",
+   "h": 126
+  },
+  "secondary": [
+   {
+    "target": "Y",
+    "h": 21
+   },
+   {
+    "target": "Y",
+    "h": 63
+   },
+   {
+    "target": "S",
+    "h": 21
+   },
+   {
+    "target": "S",
+    "h": 63
+   },
+   {
+    "target": "S",
+    "h": 126
+   },
+   {
+    "target": "D20",
+    "h": 63
+   }
+  ]
+ },
+ "train_set": {
+  "parameter_window": {
+   "first": "1990-01-31",
+   "last": "2007-06-29",
+   "month_ends": 210,
+   "source": "predictor values only (no outcome)"
+  },
+  "percentile": {
+   "q": 33.33,
+   "function": "numpy.percentile(values, 33.33), method 'linear'"
+  },
+  "standardisation": {
+   "formula": "z_jt = (x_jt - mu_j) / sd_j; mu_j, sd_j (ddof = 1) over the parameter-window month-ends at which x_j is available",
+   "mu_sd": {
+    "C01": {
+     "n": 210,
+     "mu": 12.460816958308381,
+     "sd": 14.246377205884023
+    },
+    "C02": {
+     "n": 210,
+     "mu": 0.04733949761837587,
+     "sd": 0.041331172669445575
+    },
+    "C03": {
+     "n": 210,
+     "mu": -0.19480952380952385,
+     "sd": 1.4424600902176066
+    },
+    "C04": {
+     "n": 210,
+     "mu": 1.6018095238095238,
+     "sd": 1.2266875153012458
+    },
+    "C05": {
+     "n": 210,
+     "mu": 0.8360952380952381,
+     "sd": 0.20689546276586385
+    },
+    "C06": {
+     "n": 210,
+     "mu": 0.028571047530143247,
+     "sd": 0.009875664430573163
+    },
+    "C07": {
+     "n": 204,
+     "mu": 6.1602941176470605,
+     "sd": 21.664341361153266
+    },
+    "C08": {
+     "n": 210,
+     "mu": -0.0017212714369086377,
+     "sd": 0.13513926007825686
+    },
+    "C09": {
+     "n": 210,
+     "mu": 0.013673938464799735,
+     "sd": 0.010301642692144782
+    },
+    "C10": {
+     "n": 210,
+     "mu": 0.0395624303461115,
+     "sd": 0.027811657391724927
+    },
+    "C11": {
+     "n": 210,
+     "mu": 0.0775733570507385,
+     "sd": 0.019264908805313025
+    },
+    "C12": {
+     "n": 209,
+     "mu": 0.3525398722358109,
+     "sd": 0.3605335611535852
+    }
+   },
+   "note": "C10-C12 are reported only: they are not composite members"
+  },
+  "composite": {
+   "id": "COMP",
+   "sign": 1,
+   "members": [
+    "C01",
+    "C02",
+    "C03",
+    "C04",
+    "C05",
+    "C06",
+    "C07",
+    "C08",
+    "C09"
+   ],
+   "weights": "equal",
+   "clip": [
+    -3.0,
+    3.0
+   ],
+   "min_members": 7,
+   "formula": "COMP_t = mean over members j available at t of clip(s_j * (x_jt - mu_j) / sd_j, -3, 3); missing if fewer than 7 of the 9 members are available",
+   "tau": -0.16616724368960106,
+   "tau_rule": "hold SPXL at origin t if COMP_t >= tau (the 33.33rd percentile of COMP over the parameter window), else T-bills",
+   "tau_median": -0.07034047633036489,
+   "tau_median_use": "secondary economic analysis only: the composite rule with the threshold at the train median (section 11)",
+   "n_param_window": 210,
+   "members_available_in_param_window": {
+    "8": 6,
+    "9": 204
+   }
+  },
+  "tau_j": {
+   "on": "s_j * x_j (favourable is high)",
+   "values": {
+    "C01": 6.87868640949621,
+    "C02": -0.05894477350832709,
+    "C03": -0.29680599999999985,
+    "C04": 0.8297909999999998,
+    "C05": 0.7000000000000007,
+    "C06": -0.030284842077279092,
+    "C07": -9.0,
+    "C08": -0.03143936844745997,
+    "C09": 0.010026356600269397,
+    "C10": -0.045086662184734595,
+    "C11": -0.08506358874239042,
+    "C12": 0.18055240078830073
+   },
+   "use": "the economic rule of any candidate that passes the primary test, and the secondary table of all 12 candidates"
+  },
+  "vol_managed": {
+   "c": 0.030835848120117228,
+   "w_bar": 0.7972424582841577,
+   "n_param_window": 210,
+   "c_definition": "median of IVAR_t = C10 over the parameter window",
+   "w_bar_definition": "mean of min(1, c / IVAR_t) over the parameter window",
+   "rule": "SPXL weight w_t = min(1, c / IVAR_t) at each test origin, the rest T-bills; against BH and against the constant weight w_bar (secondary, not clean: uses the VIX level)"
+  },
+  "sloos_lag_branch": {
+   "shift_months": 0,
+   "qa": {
+    "n_checked": 67,
+    "n_violations": 0,
+    "first_checked_obs": "2010-01-01"
+   },
+   "source": "ALFRED first-release dates of DRTSCILM only (build phase, panel_meta.json)"
+  }
+ },
+ "candidates": [
+  {
+   "id": "C01",
+   "short": "VRP",
+   "name": "Variance risk premium",
+   "sign": 1,
+   "in_composite": true,
+   "definition": "VIX(t-)^2/12 - RV21(t-); RV21 = sum over the 21 sessions ending at t- of (100*ln(G_i/G_{i-1}))^2, G = ^GSPC close; percent squared per month",
+   "exposure": "partial: uses the VIX; premium negative after crashes (2008, 2020 known)",
+   "ta_flag": "realised variance used only as a sign-blind risk measure (allowed, flagged)",
+   "verdict_qualifier": "partly exposed",
+   "mu": 12.460816958308381,
+   "sd": 14.246377205884023,
+   "n_param_window": 210,
+   "tau_j": 6.87868640949621,
+   "secondary_rule": "hold SPXL at origin t if +1 * C01_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C02",
+   "short": "GAP",
+   "name": "Real-time output gap",
+   "sign": -1,
+   "in_composite": true,
+   "definition": "INDPRO vintage in effect on origin date t (realtime_start=realtime_end=t); m = latest observation month; OLS ln IP_k = a + b*k + c*k^2 over months from max(1948-01, first observation) through m; GAP = residual at m; re-estimated at every origin",
+   "exposure": "clean apart from general knowledge",
+   "ta_flag": "none",
+   "verdict_qualifier": null,
+   "mu": 0.04733949761837587,
+   "sd": 0.041331172669445575,
+   "n_param_window": 210,
+   "tau_j": -0.05894477350832709,
+   "secondary_rule": "hold SPXL at origin t if -1 * C02_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C03",
+   "short": "SRATE",
+   "name": "12-month change in the 3-month Treasury yield",
+   "sign": -1,
+   "in_composite": true,
+   "definition": "DGS3MO(t-) - DGS3MO(t'-), t' = the origin 12 month-ends earlier; percentage points",
+   "exposure": "2022 hiking cycle common knowledge",
+   "ta_flag": "none (interest rate; 12-month change chosen so no moving-average construct appears)",
+   "verdict_qualifier": null,
+   "mu": -0.19480952380952385,
+   "sd": 1.4424600902176066,
+   "n_param_window": 210,
+   "tau_j": -0.29680599999999985,
+   "secondary_rule": "hold SPXL at origin t if -1 * C03_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C04",
+   "short": "TERM",
+   "name": "Term spread",
+   "sign": 1,
+   "in_composite": true,
+   "definition": "DGS10(t-) - DGS3MO(t-); percentage points",
+   "exposure": "inverted-curve penalty was inside the full-sample drift test (not isolated)",
+   "ta_flag": "none",
+   "verdict_qualifier": null,
+   "mu": 1.6018095238095238,
+   "sd": 1.2266875153012458,
+   "n_param_window": 210,
+   "tau_j": 0.8297909999999998,
+   "secondary_rule": "hold SPXL at origin t if +1 * C04_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C05",
+   "short": "DEF",
+   "name": "Default spread (Baa minus Aaa)",
+   "sign": 1,
+   "in_composite": true,
+   "definition": "DBAA(t-) - DAAA(t-); percentage points; level only",
+   "exposure": "close to clean (HY penalty could not fire before 2023-09)",
+   "ta_flag": "none",
+   "verdict_qualifier": null,
+   "mu": 0.8360952380952381,
+   "sd": 0.20689546276586385,
+   "n_param_window": 210,
+   "tau_j": 0.7000000000000007,
+   "secondary_rule": "hold SPXL at origin t if +1 * C05_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C06",
+   "short": "INFL",
+   "name": "CPI inflation, year on year",
+   "sign": -1,
+   "in_composite": true,
+   "definition": "CPIAUCNS vintage in effect on origin date t; m = latest observation month; ln(CPI_m/CPI_{m-12}); if CPI_{m-12} missing carry forward the previous origin's value; never interpolate. Fallback if ALFRED fails: m = latest published month <= origin month minus one",
+   "exposure": "2021-23 inflation and 2022 bear market known; CPI>3.5% penalty inside the drift test",
+   "ta_flag": "none",
+   "verdict_qualifier": null,
+   "mu": 0.028571047530143247,
+   "sd": 0.009875664430573163,
+   "n_param_window": 210,
+   "tau_j": -0.030284842077279092,
+   "secondary_rule": "hold SPXL at origin t if -1 * C06_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C07",
+   "short": "SLOOS",
+   "name": "Net share of banks tightening C&I lending standards",
+   "sign": -1,
+   "in_composite": true,
+   "definition": "FRED DRTSCILM from the latest observation usable at t, held constant between releases; an observation dated at the start of quarter q is usable from the last session of the first month after quarter q ends (e.g. 1990-04-01 usable from 1990-07-31)",
+   "exposure": "clean apart from general knowledge; the returns paper's sample includes 2008",
+   "ta_flag": "none (survey)",
+   "verdict_qualifier": null,
+   "mu": 6.1602941176470605,
+   "sd": 21.664341361153266,
+   "n_param_window": 204,
+   "tau_j": -9.0,
+   "secondary_rule": "hold SPXL at origin t if -1 * C07_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C08",
+   "short": "CLAIMS",
+   "name": "Initial jobless claims, year on year",
+   "sign": -1,
+   "in_composite": true,
+   "definition": "w = latest week-ending Saturday with w + 5 days <= t; ln(sum ICNSA weeks w-3..w) - ln(sum ICNSA weeks w-55..w-52)",
+   "exposure": "2008 and 2020 spikes known; 2020 capped by the composite clip",
+   "ta_flag": "none",
+   "verdict_qualifier": null,
+   "mu": -0.0017212714369086377,
+   "sd": 0.13513926007825686,
+   "n_param_window": 210,
+   "tau_j": -0.03143936844745997,
+   "secondary_rule": "hold SPXL at origin t if -1 * C08_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C09",
+   "short": "ECY",
+   "name": "Excess CAPE yield",
+   "sign": 1,
+   "in_composite": true,
+   "definition": "q = backtest_rating.reported_quarter(t); m = latest CPIAUCNS month in the vintage at t; CAPE = (P(t-)/CPI_m) / mean over k=q-119..q of (E_k/CPI_k); RR10 = DGS10(t-)/100 - ((CPI_m/CPI_{m-120})^(1/10) - 1); ECY = 1/CAPE - RR10; P = ^GSPC close; E = Shiller trailing 12-month earnings; Shiller's own CAPE / ECY columns not used; level only",
+   "exposure": "partial: valuation drift added no 6-month skill; valuation term added nothing 1881-2026; 2010s known",
+   "ta_flag": "valuation level only (allowed); changes forbidden",
+   "verdict_qualifier": "partly exposed",
+   "mu": 0.013673938464799735,
+   "sd": 0.010301642692144782,
+   "n_param_window": 210,
+   "tau_j": 0.010026356600269397,
+   "secondary_rule": "hold SPXL at origin t if +1 * C09_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C10",
+   "short": "IVAR",
+   "name": "Implied variance (VIX squared)",
+   "sign": -1,
+   "in_composite": false,
+   "definition": "(VIX(t-)/100)^2",
+   "exposure": "NOT CLEAN: VIX spikes followed by rebounds seen; hurdle (mostly VIX) seen to have no timing value",
+   "ta_flag": "none (option-implied)",
+   "verdict_qualifier": "not a clean out-of-sample test",
+   "mu": 0.0395624303461115,
+   "sd": 0.027811657391724927,
+   "n_param_window": 210,
+   "tau_j": -0.045086662184734595,
+   "secondary_rule": "hold SPXL at origin t if -1 * C10_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C11",
+   "short": "HURDLE",
+   "name": "Leverage-cost hurdle (spxlcast/assess.py)",
+   "sign": -1,
+   "in_composite": false,
+   "definition": "column hurdle of the pinned rating_backtest.csv at origin t: exp((fees + 2*(3m bill + 0.75%))/3 + 1.5*sigma_1y^2) - 1 via spxlcast.assess.leverage_cost",
+   "exposure": "NOT CLEAN: full-sample tercile results and (per brief) rank correlation about -0.03 seen",
+   "ta_flag": "none",
+   "verdict_qualifier": "not a clean out-of-sample test",
+   "mu": 0.0775733570507385,
+   "sd": 0.019264908805313025,
+   "n_param_window": 210,
+   "tau_j": -0.08506358874239042,
+   "secondary_rule": "hold SPXL at origin t if -1 * C11_t >= tau_j, else T-bills"
+  },
+  {
+   "id": "C12",
+   "short": "SCORE",
+   "name": "Retired rating score (spxlcast/rating.py)",
+   "sign": 1,
+   "in_composite": false,
+   "definition": "column score of the pinned rating_backtest.csv at origin t: mean of clip(annualised 6-month median excess return / 15%) and clip(annualised Sharpe-like ratio / 0.5), full model, no news",
+   "exposure": "NOT CLEAN: full-sample 6-month rank correlation -0.03 and half-sample threshold behaviour seen",
+   "ta_flag": "none",
+   "verdict_qualifier": "not a clean out-of-sample test",
+   "mu": 0.3525398722358109,
+   "sd": 0.3605335611535852,
+   "n_param_window": 209,
+   "tau_j": 0.18055240078830073,
+   "secondary_rule": "hold SPXL at origin t if +1 * C12_t >= tau_j, else T-bills"
+  }
+ ],
+ "primary_test": {
+  "predictors": [
+   "C01",
+   "C02",
+   "C03",
+   "C04",
+   "C05",
+   "C06",
+   "C07",
+   "C08",
+   "C09",
+   "C10",
+   "C11",
+   "C12",
+   "COMP"
+  ],
+  "K": 13,
+  "target": "Y",
+  "h": 126,
+  "sample": "test origins for h = 126 (2008-01-31..2026-02-27, 218) at which the predictor and Y(t,126) both exist",
+  "statistic": "r = spxlcast.evaluation.spearman(s_P * P_t, Y(t,126)); s_COMP = +1",
+  "n_eff": "spxlcast.evaluation.effective_n(session positions (panel column pos) of the sample's origins, 126)",
+  "z": "atanh(r) * sqrt(n_eff - 3) / sqrt(1 + r^2 / 2)",
+  "p_one_sided": "1 - Phi(z) (scipy.stats.norm.sf(z)); p = 1 if r is undefined or n_eff <= 4; p = 0 if r = 1",
+  "interval": "backtest_rating._corr_ci(r, n_eff), 90%",
+  "correction": {
+   "method": "Holm step-down",
+   "alpha": 0.05,
+   "K": 13,
+   "rule": "sort p ascending (ties in the order C01..C12, COMP); reject H_(i) while p_(i) <= 0.05 / (13 - i + 1); stop at the first failure",
+   "adjusted_p": "running maximum of min(1, (13 - i + 1) * p_(i))"
+  },
+  "pass": "a hypothesis rejected by Holm is a primary statistical pass for that predictor",
+  "not_tested_rule": "a candidate whose data cannot be built is 'not tested': K stays 13 and its p is 1"
+ },
+ "secondary_tests": {
+  "families": [
+   {
+    "id": "F2",
+    "target": "Y21",
+    "h": 21,
+    "direction": "r > 0"
+   },
+   {
+    "id": "F3",
+    "target": "Y63",
+    "h": 63,
+    "direction": "r > 0"
+   },
+   {
+    "id": "F4",
+    "target": "S126",
+    "h": 126,
+    "direction": "r > 0"
+   },
+   {
+    "id": "F5",
+    "target": "S63",
+    "h": 63,
+    "direction": "r > 0"
+   },
+   {
+    "id": "F6",
+    "target": "S21",
+    "h": 21,
+    "direction": "r > 0"
+   },
+   {
+    "id": "F7",
+    "target": "-D20",
+    "h": 63,
+    "direction": "r > 0 against -D20"
+   }
+  ],
+  "same_as_primary": "predictors, statistic, n_eff (with the family's h), one-sided p, 90% interval; Holm within each family of 13",
+  "status": "reported, never decisive",
+  "replication": "the primary test and F2-F7 on train origins, reported beside the test period as published-sample replication (research/train_results.md holds the train side)"
+ },
+ "economic_test": {
+  "rule": "at each test origin t from 2008-01-31 through 2026-07-31 hold the realised fund (backtest_rating.build_daily column fund_ret: the synthetic 3x fund through 2008-12-31, SPXL from 2009-01-02) from the close of t to the close of the next month-end if COMP_t >= tau, else T-bills (tbill_ret)",
+  "holding_periods": 223,
+  "sessions": [
+   "2008-02-01",
+   "2026-08-31"
+  ],
+  "holding_sessions": "the holding decided at the origin with session position a, followed by the month-end at position b, earns the daily returns of sessions a+1..b",
+  "switch_cost": 0.001,
+  "switch_cost_application": "a switch between SPXL and T-bills multiplies wealth by (1 - 0.001) at the start of the first session of the new holding: that session's return is (1 - 0.001) * (1 + r) - 1",
+  "initial_allocation": "free for every strategy (rule, MIX_w, vol-managed, constant w_bar), as for BH: costs apply only to changes between consecutive holdings",
+  "missing_signal": "keep the previous holding (the count is reported); T-bills if the signal is missing at the first origin",
+  "benchmarks": {
+   "BH": "buy-and-hold the realised fund over the same sessions, no cost",
+   "MIX_w": "w in the realised fund and 1 - w in T-bills, w = (number of the 223 holdings in SPXL) / 223; the two sleeves drift within each month and are rebalanced to w at each month-end close; cost 0.001 * |w - w_pre| on the first session of the new month (w_pre = the fund's weight just before rebalancing), applied as the switch cost"
+  },
+  "metrics": {
+   "daily_returns": "fund_ret and tbill_ret with a missing value treated as 0, as backtest_rating.strategy_section",
+   "CAGR": "W_N^(252 / N) - 1, W the wealth after the N sessions 2008-02-01..2026-08-31 (W_0 = 1)",
+   "Sharpe": "mean / sd (ddof = 1) of the daily (return - tbill_ret) * sqrt(252)",
+   "max_drawdown": "max over sessions of 1 - W_t / max_{s <= t} W_s over the wealth path W_1..W_N, as backtest_rating.strategy_section"
+  },
+  "pass_all_of": {
+   "E1": "CAGR(rule) > CAGR(BH) and CAGR(rule) > CAGR(MIX_w)",
+   "E2": "Sharpe(rule) > Sharpe(BH) and Sharpe(rule) > Sharpe(MIX_w)",
+   "E3": "max_drawdown(rule) < max_drawdown(BH)",
+   "E4": "Sharpe(rule) > Sharpe(BH) within sessions 2008-02-01..2016-12-30 and within 2017-01-03..2026-08-31"
+  },
+  "E4_halves": [
+   [
+    "2008-02-01",
+    "2016-12-30"
+   ],
+   [
+    "2017-01-03",
+    "2026-08-31"
+   ]
+  ],
+  "E4_method": "Sharpe of the full-period daily return series restricted to each half's sessions (the strategies are not restarted)",
+  "also_applied_to": "every candidate that passes the primary test, with its own tau_j (hold SPXL if s_j * x_jt >= tau_j) and the same criteria; for all 12 candidates as a secondary table",
+  "secondary_descriptive": {
+   "costs": "the composite rule with 0 and 0.0025 switching costs",
+   "median_threshold": "the composite rule with COMP_t >= tau_median",
+   "stationary_bootstrap": {
+    "what": "90% intervals for Sharpe(rule) - Sharpe(BH) and CAGR(rule) - CAGR(BH)",
+    "data": "the 223 monthly holding-period returns of the rule and of BH (costs included) and the monthly T-bill holding-period returns, resampled as aligned triples",
+    "algorithm": "rng = numpy.random.default_rng(20260927); U = rng.random((10000, 223)); S = rng.integers(0, 223, size=(10000, 223)); idx[:, 0] = S[:, 0]; for i >= 1: idx[:, i] = S[:, i] where U[:, i] < 1/6 else (idx[:, i-1] + 1) mod 223 (Politis-Romano, circular, mean block 6 months)",
+    "statistics": "monthly Sharpe = mean / sd (ddof = 1) of (r - r_bill) * sqrt(12); CAGR = prod(1 + r)^(12 / 223) - 1",
+    "interval": "numpy.percentile of the 10000 differences at 5 and 95 (linear)"
+   },
+   "vol_managed": "w_t = min(1, c / IVAR_t) at each test origin (IVAR = C10), rest T-bills; sleeves drift within the month; cost 0.001 * |w_t - w_pre|; if IVAR_t is missing the previous target weight is kept; compared with BH and with a constant w_bar under the same mechanics",
+   "descriptives": "time in SPXL, number of switches, turnover (sum of |weight traded|), total costs paid"
+  }
+ },
+ "robustness": {
+  "halves": {
+   "origins": [
+    [
+     "2008-01",
+     "2016-12"
+    ],
+    [
+     "2017-01",
+     "2026-02"
+    ]
+   ],
+   "label": "'one half only' if r is not positive in both"
+  },
+  "episodes_left_out": [
+   {
+    "name": "financial crisis",
+    "origins": [
+     "2008-01",
+     "2009-06"
+    ]
+   },
+   {
+    "name": "2020 crash",
+    "origins": [
+     "2019-09",
+     "2020-06"
+    ]
+   },
+   {
+    "name": "inflation and rate shock",
+    "origins": [
+     "2021-07",
+     "2022-12"
+    ]
+   }
+  ],
+  "episode_method": "drop the origins whose month lies in the episode (inclusive); r, n_eff (of the remaining positions) and one-sided p recomputed; 'episode-dependent' if p > 0.10 for any one episode",
+  "moving_block_bootstrap": {
+   "what": "90% interval for the primary r of each predictor",
+   "algorithm": "for each predictor a fresh rng = numpy.random.default_rng(20260927); the predictor's primary sample in origin order (n rows); k = ceil(n / 12) blocks per resample; starts = rng.integers(0, n - 12 + 1, size=(10000, k)); each resample is the concatenation of rows start..start+11 of its k blocks, cut to n rows; r_b = spearman on the resample",
+   "interval": "numpy.percentile of the finite r_b at 5 and 95 (linear)"
+  },
+  "expanding_window_composite": "at each origin t, mu_j(t) and sd_j(t) (ddof = 1) over the month-ends from 1990-01-31 through t inclusive at which x_j is available; member j is available at t only if x_jt exists and it has at least 60 such values; then the section 7 formula (clip 3, at least 7 members); its primary r is reported",
+  "partial_spearman": "controls ln VIX(t-) (ln of panel column vix_tm) and DGS3MO(t-) (panel column y3_tm): average ranks of s_P * P, Y(t,126) and both controls over the rows where all four exist; OLS of rank(s_P * P) and of rank(Y) on [1, rank(ln VIX), rank(DGS3MO)]; the partial r is the Pearson correlation of the two residual vectors; one-sided p as section 9 with n_eff - 5 in place of n_eff - 3; for primary-passing predictors (reported for all)",
+  "synthetic_spread": "rebuild the daily frame with dataclasses.replace(Config(), swap_spread = 0.0025) and 0.0125 (only fund returns before 2009-01-02 change); recompute Y(t,126) and the 13 primary r and p (reported only)"
+ },
+ "verdict": [
+  {
+   "condition": "primary Holm pass AND economic pass",
+   "label": "Timing signal confirmed",
+   "qualifiers": {
+    "C10, C11, C12": "not a clean out-of-sample test",
+    "C01, C09": "partly exposed"
+   }
+  },
+  {
+   "condition": "primary Holm pass, economic fail",
+   "label": "Predictive, not usable by the registered rule"
+  },
+  {
+   "condition": "composite economic pass, no primary pass",
+   "label": "Not confirmed (gain could be luck); candidate for a new pre-registration on future data only"
+  },
+  {
+   "condition": "neither",
+   "label": "No timing signal found"
+  }
+ ],
+ "robustness_labels": {
+  "episode-dependent": "one-sided p > 0.10 when any one episode's origins are left out",
+  "one half only": "r not positive in both halves (origins 2008-01..2016-12 and 2017-01..2026-02)"
+ },
+ "sanity_checks_test_phase": [
+  "pinned inputs, predictor_inputs.pkl, prereg files, this file and train_params.json match their recorded hashes",
+  "target reproduction at all origins: rebuilt Y, S and D20 equal the pinned CSV's excess_h, sp_h - tbill_h and real_dd20_63 (tolerance 1e-9)",
+  "legacy reproduction: spearman(score, Y(t,126)) over every month-end 1990-01-31..2026-02-27 with both (the pinned CSV's score column, as the README computed it, so the two D5 origins are included) is -0.03 +/- 0.01, else fixed as a deviation before anything is interpreted",
+  "synthetic fund: daily correlation of syn_ret with spxl_ret from 2009-01-02 where both exist (backtest_rating.validate_synthetic) is at least 0.99",
+  "coverage: non-missing share of every candidate and of COMP at test origins; below 90% at h = 126 flags that predictor's test",
+  "look log summarised in the results"
+ ],
+ "test_phase_preconditions": [
+  "py scripts/research_signals.py test --unseal <SHA-256 of research/PREREGISTRATION.md>",
+  "verify_unseal: the token, research/PREREG_HASH.txt, and output/research/train_params.json against research/TRAIN_REPORT.md",
+  "research/frozen_spec.json against research/FROZEN_HASH.txt, and byte-identical to output/research/train_params.json",
+  "run once; afterwards only bug fixes, reporting original and corrected results (DEVIATIONS.md)"
+ ],
+ "interpretations": [
+  "I1 tau and tau_j use q = 33.33 exactly as registered (not 100/3)",
+  "I2 COMP averages the available clipped signed z-scores with equal weight; it is missing below 7 members",
+  "I3 holdings, switch costs, initial allocation and missing signals as in economic_test above",
+  "I4 MIX_w and the vol-managed rules drift within the month and pay 0.001 x |weight traded| at each month-end rebalance",
+  "I5 metrics follow backtest_rating.strategy_section (daily NaN returns as 0; drawdown over W_1..W_N); Sharpe uses ddof = 1; E4 restricts the full-period daily series to each half",
+  "I6 the stationary and moving-block bootstrap algorithms and seeds above",
+  "I7 the expanding-window composite includes month-end t and needs 60 values per member",
+  "I8 the partial Spearman is the partial correlation of average ranks, p with n_eff - 5",
+  "I9 Holm ties keep the order C01..C12, COMP",
+  "I10 the legacy reproduction uses the pinned CSV's score column at every month-end with Y(t,126)",
+  "These were fixed before unsealing and before any train-period outcome statistic was looked at; none depends on a train-period result"
+ ],
+ "outputs": "research/RESULTS.md and output/research/test/*: 13 primary tests (r, n, n_eff, 90% interval, raw and Holm p, pass/fail); F2-F7; train replication; composite economic test with benchmarks and E1-E4; secondary economic tables; all sanity checks; deviations; look-log summary; verdict in the registered words, including 'No timing signal found'"
+}

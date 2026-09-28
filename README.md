@@ -1,7 +1,8 @@
 spxlcast.com
 
-Fundamentals-driven price forecast for **SPXL** (Direxion Daily S&P 500 Bull 3X), with a
-**Buy / Hold / Sell** rating and a **percentile lookup** for any price level.
+Fundamentals-driven price forecast for **SPXL** (Direxion Daily S&P 500 Bull 3X), with a plain
+**assessment** of what holding it costs and risks right now (leverage cost, drawdown risk, the 3-month
+price range) and a **percentile lookup** for any price level. It does not tell you to buy or sell.
 
 The forecast is a Monte Carlo distribution of SPXL prices built from:
 
@@ -28,7 +29,7 @@ pip install -r requirements.txt
 ## Use
 
 ```bash
-# full report: rating, distribution, drivers, influencer metrics, news
+# full report: assessment, distribution, drivers, influencer metrics, news
 python -m spxlcast
 
 # where do 190 and 200 sit in the distribution? (percentile + chance of a limit order filling)
@@ -61,19 +62,43 @@ drift up to 50 points either side of it.
 
 ## How to read the output
 
-**Rating.** Judged at the rating horizon (default 6 months = 126 trading days) from two views of
-the simulated distribution, each scaled to [-1, 1] and averaged into a score:
+**Assessment.** The report (and the status page) opens with three statements the model can back up.
+Each level is placed against the 440 month-ends from 1990 to 2026 of the full-model backtest below:
+low, normal and high (or elevated) are the bottom, middle and top thirds of those months. The cutoffs
+and the history live in `spxlcast/reference.json`; without that file the levels read n/a.
 
-* *typical outcome* - annualised median SPXL return minus the T-bill return, divided by 15%
-* *expected value* - annualised mean excess return per unit of volatility (a Sharpe-like ratio),
-  divided by 0.5
+* *Leverage cost* - the S&P 500 total return per year, on average and dividends included, that SPXL
+  needs to break even over the long run: the "hurdle". It comes from what SPXL gives up each year
+  compared with 3 times the S&P 500's return: borrowing (it borrows twice its value at the 3-month
+  bill plus 0.75%), fees (the expense ratio) and volatility drag (SPXL resets to 3x every day, which
+  loses money when the market zigzags; the bigger the swings, the bigger the loss). The S&P 500 has to
+  make up about a third of that, plus a little for its own swings. Low is below 5.6%, high is 7.6% and
+  above. Over a single year SPXL's typical outcome can be ahead at a lower S&P 500 return, because
+  volatility comes in bursts; the hurdle is where it goes nowhere over the long run. The model's
+  long-run S&P 500 estimate is shown next to it for comparison: it is an average over many years, not
+  a forecast for the coming months, and since 1990 it has run below what the S&P 500 actually returned
+  (see the drift backtest below).
+* *Drawdown risk* - the chance SPXL closes at least 20% below today's price on some day in the next
+  3 months (63 trading days), even if it recovers afterwards. Low is below 16.9%, elevated is 32.1%
+  and above. The report adds how often such a fall actually followed in the backtest's months at the
+  same level: 8.8% of the time at low (11.7% predicted), 22.4% at normal (24.5%) and 35.4% at
+  elevated (42.5%). Before 2009 those months use a 3x fund rebuilt from the S&P 500; on SPXL alone
+  the elevated level ran well high (see the backtest below).
+* *3-month price range* - SPXL ends inside it in 90% of the simulations (5% below, 5% above); the
+  typical (middle) price is shown too. In the backtest, 3-month ranges held 93% of outcomes.
 
-Score >= +0.30 with a positive median edge is **BUY**, score <= -0.30 is **SELL**, otherwise
-**HOLD**. Conviction is High / Medium / Low by |score|. The score is printed with its Monte Carlo
-standard error and the rating is flagged as borderline when a threshold lies within one standard
-error. Every driver of the distribution is listed under the rating so the verdict is auditable.
-For a 3x fund the median is dragged down by volatility decay while the mean is not, which is why
-both views are used.
+None of this is a buy or sell signal, and the tool gives none. High cost or risk has not meant lower
+returns: in the backtest, months at high leverage cost or elevated drawdown risk were not followed by
+lower returns on average, though elevated risk did bring more 20% falls. The tool used to give a
+BUY / HOLD / SELL rating, but the same test found it did not pick better times to own SPXL: over the
+next 6 months, months rated BUY returned 4.2 points less than the others on average (90% interval
+-18.0 to +9.6 points). The forecast ranges held up in the same test: its 90% ranges held 91-93% of
+outcomes from one week to six months, though the chance of a 20% fall ran 4-6 points high at three
+to six months. So the output now describes cost and risk, which the backtest supports better (the
+ranges held, the fall chances sort months by risk but run high, and the cost estimate matched SPXL's
+on average), instead of giving a verdict. The rating is still computed and logged for research
+(`rating`, `score`, `score_se` and `conviction` in the track record, `rating` in `forecast.json` and
+`spot_log.csv`; see Model, item 5), but it is not shown.
 
 **Price percentile.** For a price P and each horizon:
 
@@ -84,10 +109,10 @@ both views are used.
 * *P(rises to level)* - the same for a sell-limit above spot.
 
 The **buy-limit ladder** inverts this: it lists the prices with a 90/75/50/25/10% chance of being
-touched within the rating horizon, with the median end price and the chance of profit computed only
-over the paths on which the order fills. At short horizons many paths never trade below the spot, so
-when no price below it has a 90% (or 75%) chance of filling, those rungs are replaced by one
-at-market rung at the spot, shown as 100%.
+touched within 6 months (`--rating-horizon`), with the median end price and the chance of profit
+computed only over the paths on which the order fills. At short horizons many paths never trade
+below the spot, so when no price below it has a 90% (or 75%) chance of filling, those rungs are
+replaced by one at-market rung at the spot, shown as 100%.
 
 ## Model
 
@@ -123,9 +148,10 @@ at-market rung at the spot, shown as 100%.
    company's index weight (six times the weight, capped at 1), and a story about neither is scaled
    by a further 0.25. VADER is extended with a finance vocabulary and clause-aware phrase rules that
    know "rate cuts" are good and "yields jump" is bad for stocks. The score in [-1, 1] shifts the
-   drift of the first 10 trading days by up to +/-5% annualised in the displayed price tables. The
-   rating is computed on a second simulation without the tilt, so an uncalibrated news score can
-   never flip a label.
+   drift of the first 10 trading days by up to +/-5% annualised in the displayed price tables and the
+   assessment (at the extreme score that moves the 3-month chance of a 20% dip by about one point).
+   The retired rating is computed on a second simulation without the tilt, so an uncalibrated news
+   score can never flip its label.
 4. **Simulation**: 50,000 paths of daily S&P 500 total returns with skewed Student-t shocks
    (4 degrees of freedom, skew 0.9 for larger down moves than up moves, capped at +/-20% a day)
    under the stochastic-vol process above.
@@ -133,8 +159,18 @@ at-market rung at the spot, shown as 100%.
    noise`; volatility decay is not assumed, it emerges from compounding. Leverage and tracking noise
    are checked against a two-year robust regression of SPXL on SPY that excludes close-versus-NAV
    dislocation days.
-5. **Rating and percentiles** are read directly off the simulated paths (terminal prices, running
-   minimum and maximum).
+5. **Assessment and percentiles** are read directly off the simulated paths (terminal prices, running
+   minimum and maximum), except the leverage-cost hurdle, which is the closed-form break-even
+   `ETFParams.breakeven_index_return` at the 1-year vol: the fund's average log growth is zero when
+   `ln(1 + index return) = (fees + financing) / 3 + 3/2 x vol^2`. At a constant vol its median is then
+   flat too; with the simulation's bursts of volatility the 1-year median sits a few points higher and
+   approaches flat only over longer holds. The levels compare today's hurdle and 3-month dip chance
+   with the backtest's month-ends (`spxlcast/assess.py`, `spxlcast/reference.json`).
+   The BUY / HOLD / SELL rating (`spxlcast/rating.py`) is still computed and logged but no longer
+   shown: the average of the 6-month median return over T-bills divided by 15% and a Sharpe-like
+   ratio divided by 0.5, BUY at +0.30 or more with a positive median edge, SELL at -0.30 or less. It
+   had no timing value in the backtest: the rank correlation of its score with the next 6 months'
+   SPXL return over T-bills was -0.03 (90% interval -0.22 to +0.17).
 
 Everything is configurable in `spxlcast/config.py`.
 
@@ -146,17 +182,25 @@ on historical assumptions.
 
 ```bash
 python -m spxlcast log            # quiet forecast, appended to logs/forecast_log.csv
-python -m spxlcast score          # PIT, band coverage, drawdown-touch hit rates, returns by rating,
-                                  # and whether the news score predicted the next two weeks
+python -m spxlcast score          # PIT, band coverage, drawdown-touch hit rates, drawdown risk by
+                                  # level, and whether the news score predicted the next two weeks
 ```
+
+Each row records the assessment the run showed (`hurdle`, `leverage_cost`, `drawdown_risk`) next to
+the retired rating's columns. The scorer's "Drawdown risk check" table checks the page's main
+risk statement: for each level, the predicted chance of a 20% dip within 3 months (63 sessions)
+against how often SPXL actually closed 20% or more below the logged price within them, with the
+backtest's figures at that level beside it. Rows logged before the column existed are placed by
+their logged 3-month dip chance (`h63_p_dd20`) against the cutoffs in `spxlcast/reference.json`.
 
 The scorer is honest about overlap: forecasts a day apart share most of their outcome window, so
 each horizon reports how many independent outcomes the rows amount to (a year of daily 1-month
 forecasts holds about 12) and 90% intervals computed in closed form on that number of independent
-outcomes (a t interval for mean PIT and for CRPS skill, a Wilson interval for band coverage) once
-there are at least three; in simulations of perfectly calibrated forecasts the mean-PIT and skill
-intervals cover about 82-90% at three to seven independent outcomes and 88-93% from about a dozen on,
-and the band-coverage interval is conservative (94-98%).
+outcomes (a t interval for mean PIT and for CRPS skill, a Wilson interval for band coverage and for
+the dip frequency by drawdown-risk level) once there are at least three; in simulations of perfectly
+calibrated forecasts the mean-PIT and skill intervals cover about 82-90% at three to seven
+independent outcomes and 88-93% from about a dozen on, and the band-coverage interval is conservative
+(94-98%).
 It also grades the whole distribution with CRPS against a naive lognormal at the raw VIX with a
 T-bill drift, and with `--archive DIR` it scores each run on its archived 103-point percentile
 grid rather than the nine logged quantiles.
@@ -192,11 +236,13 @@ rejected".
 `infra/deploy.ps1` creates a scheduled Container Apps Job that runs the forecast hourly through
 the US session plus once after the close (13:40 to 21:40 UTC, weekdays), appends to the track
 record on an Azure Files share and rescores it, plus an always-on web app that serves a status
-page (latest report, fan chart, score, CSV/JSON downloads). Intraday runs give a live rating and
+page (latest report, fan chart, score, CSV/JSON downloads). Intraday runs give a live assessment and
 price percentiles; the after-close run is the one the track record keeps. Between full runs the
 web app re-prices the latest forecast at the live SPXL quote every minute of the session (the
 simulated distribution is one of returns, so prices scale with the quote and the fixed price
-checks are re-read off stored percentile grids), shows that at the top of the page and records
+checks are re-read off stored percentile grids), shows that at the top of the page with the latest
+run's `leverage cost <level> · drawdown risk <level>` (both are about returns, so they change only
+with a full run; the 3-month range scales with the quote like every other price) and records
 the quote in `logs/spot_log.csv`. That file's `base_run_at` names the full run in the track record's
 `run_at` form (`2026-09-22T21:40:21Z`); rows written before this form carry
 `2026-09-22T21:40:21.218019+00:00`, which must be floored to the second (never rounded) to join.
@@ -256,7 +302,8 @@ See `infra/DEPLOY.md` sections 10 and Archive.
 python -m pytest
 python scripts/backtest_calibration.py --drift 0.07     # the engine: bands and touch probabilities
 python scripts/backtest_drift.py                        # the drift model: 145 years of Shiller data
-python scripts/backtest_rating.py                       # the full model and the rating, 1990-2026
+python scripts/backtest_rating.py                       # the full model, the rating and the assessment, 1990-2026
+python scripts/backtest_rating.py --write-reference     # ... and copy its levels to spxlcast/reference.json
 ```
 
 **Engine calibration.** The first script builds the model's inputs at every month-end since 2016
@@ -285,9 +332,9 @@ is why it is off by default. Since 1990 the model has run low (bias -4.8% a year
 said about 6.6% a year while the S&P 500 returned 15.4%, which explains the upward bias in the
 engine backtest.
 
-**Full model and rating.** The third script runs the live model's own functions at every month-end
-from 1990 to 2026 (440 of them) on data available at the time: Shiller earnings and dividends of
-the last quarter already reported (two months after it ends; Shiller interpolates the months in
+**Full model, rating and assessment.** The third script runs the live model's own functions at
+every month-end from 1990 to 2026 (440 of them) on data available at the time: Shiller earnings and
+dividends of the last quarter already reported (two months after it ends; Shiller interpolates the months in
 between, so reading one of those would leak part of an unreported quarter), the 10-year breakeven
 from 2003 (trailing CPI inflation before), FRED rates, CPI and unemployment as released (CPI
 inflation and the Sahm gap by calendar month, through the live model's own functions), and the
@@ -315,5 +362,40 @@ about 73 independent ones), the same construction as the track record's. Finding
   at volatility spikes near market bottoms. SPXL averaged +39% over the following six months but
   beat T-bills in only half of them; four episodes are far too few to tell (+26% more than the
   other months, 90% interval -53% to +105%). No BUY/SELL threshold worked in both halves of the
-  sample, so the thresholds are left unchanged; treat the rating as a summary of the risk-reward
-  the model sees, not a timing signal.
+  sample. So the rating was retired from view (it is still computed and logged) and replaced by the
+  assessment below.
+* The assessment's levels are the terciles of these month-ends, written to
+  `output/backtest/reference.json` (`--write-reference` also copies it to `spxlcast/reference.json`,
+  where the report and page read it). Leverage cost: low below 5.6%, normal 5.6% to 7.6%, high 7.6%
+  and above (median 6.9%, range 3.3% to 17.3%). Drawdown risk: low below 16.9%, normal 16.9% to
+  32.1%, elevated 32.1% and above (median 24.2%, range 6.1% to 69.9%).
+* The drawdown-risk levels sort risk over the whole sample, less clearly on SPXL itself. A 20% dip
+  within 3 months followed 8.8% of the time at low (11.7% predicted; 90% interval 5% to 16%; 147
+  months, about 66 independent), 22.4% at normal (24.5% predicted; 16% to 31%; 143 months, 82) and
+  35.4% at elevated (42.5% predicted; 26% to 46%; 147 months, 64). On SPXL alone (2009 on) a dip
+  followed 14% of the time at low, 25% at normal and 27% at elevated, where 44% was predicted (90%
+  interval 16% to 43%; 59 months, about 28 independent); before 2009 (the simulated fund) 4%, 19% and
+  41%. Overall the prediction runs high (26% predicted, 22% happened), with the largest gap at the
+  elevated level since 2009, which is why the page quotes what actually happened at each level.
+* The leverage cost matches SPXL's realised cost on average. On SPXL itself (2009-01 to 2026-02,
+  206 month-ends, about 35 independent six-month windows) the predicted yearly cost plus volatility
+  drag (fees + financing + L(L-1)/2 x vol^2 at the 1-year vol) averaged 13.1% against 14.4% realised
+  (3 x the S&P 500's log return minus SPXL's, per year, over the next 6 months): a difference of
+  +1.3% (90% interval -2.0% to +4.5%), correlation +0.26 (-0.03 to +0.51). The level is not a
+  timing signal either: 6-month returns over T-bills in high-cost months differed from the rest by
+  +9.4% (-5.6% to +24.4%), in low-cost months by -4.1% (-16.2% to +8.0%).
+
+### Signal research
+
+Since the rating had no timing value, a separate study searched for a real timing signal for SPXL, with
+no technical analysis: twelve valuation, macro, rate, credit, inflation, jobless-claims, bank-lending and
+volatility indicators, plus an equal-weight blend of nine of them. Everything was fixed and hashed in
+advance (`research/PREREGISTRATION.md`), set on 1990-2007 and tested once on 2008-2026. **No timing
+signal was found**: none of the 13 passed the statistical test after correcting for trying 13, and the
+blend's switching rule lost to buy-and-hold SPXL (11.8% against 17.9% a year). So the page gives no
+timing indicator. The plain-language summary, every registered table, the exploratory checks made for
+three independent reviews, and the limitations are in [research/RESULTS.md](research/RESULTS.md).
+
+```bash
+python scripts/research_signals.py report   # regenerates research/test_results.md and research/RESULTS.md
+```

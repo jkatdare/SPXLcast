@@ -41,7 +41,7 @@ pre{{background:#151b22;border:1px solid #2a323c;border-radius:6px;padding:12px;
 img{{max-width:100%;border-radius:6px;border:1px solid #2a323c}} a{{color:#7cc4ff}}
 .row{{display:flex;flex-wrap:wrap;gap:16px}} .row>div{{flex:1 1 480px}}
 .live{{background:#151b22;border:1px solid #2a323c;border-radius:6px;padding:12px 16px;margin-bottom:16px}}
-.live .spot{{font-size:28px;font-weight:bold}} .live .BUY{{color:#5fd37a}} .live .HOLD{{color:#e6c34a}} .live .SELL{{color:#ff6b6b}}
+.live .spot{{font-size:28px;font-weight:bold}} .live .lvl{{color:#7cc4ff}}
 .live table{{border-collapse:collapse;margin-top:8px;font-size:13px}} .live th,.live td{{padding:3px 10px;text-align:right;border-bottom:1px solid #2a323c}}
 .live th:first-child,.live td:first-child{{text-align:left}} .dim{{color:#9aa}}
 </style></head><body>
@@ -126,8 +126,6 @@ def _live_block(live: dict, now: datetime) -> str:
         age = (now - (asof if asof.tzinfo else asof.replace(tzinfo=timezone.utc))).total_seconds() / 60.0
     except (KeyError, TypeError, ValueError):
         age = float("nan")
-    r = live["rating"]
-    label = html.escape(str(r["label"]))
     # the calendar, not the stored flag: a loop that stopped, or got no quote since the open, leaves a
     # flag from the last session, and the block must then read open and stale
     is_open = _session_hours(now)
@@ -138,8 +136,7 @@ def _live_block(live: dict, now: datetime) -> str:
         '<div class="live">',
         f'<div><span class="spot">{html.escape(str(live.get("etf") or "SPXL"))} {spot:,.2f}</span> '
         f'<span class="dim">as of {_fmt_ny(str(live["asof_ny"]))}, {state}{stale}</span></div>',
-        f'<div>rating <b class="{label}">{label}</b> ({html.escape(str(r["conviction"])).lower()}, score {r["score"]:+.2f}) '
-        f'over {_horizon_label(int(r["horizon_days"]))} &nbsp;|&nbsp; {live["change_vs_base"]:+.2%} since the full run '
+        f'<div>{_assessment_line(live.get("assessment"))}{live["change_vs_base"]:+.2%} since the full run '
         f'at {live["base_spot"]:,.2f}</div>',
     ]
     horizons = sorted(live.get("horizons", {}).values(), key=lambda x: x["horizon"])
@@ -151,12 +148,46 @@ def _live_block(live: dict, now: datetime) -> str:
         cells = "".join(_check_cell(row, spot) for row in h.get("price_lookup", []))
         rows.append(f'<tr><td>{_horizon_label(int(h["horizon"]))}</td><td>{q["5.0"]:,.0f}</td><td>{q["50.0"]:,.0f}</td>'
                     f'<td>{q["95.0"]:,.0f}</td><td>{h["p_positive"]:.0%}</td><td>{h["p_drawdown_20"]:.0%}</td>{cells}</tr>')
-    parts.append('<table><tr><th>Horizon</th><th>Bad case (5%)</th><th>Typical</th><th>Good case (95%)</th>'
+    parts.append('<table><tr><th>Horizon</th><th>Low end (5% below)</th><th>Typical</th><th>High end (5% above)</th>'
                  f'<th>P(up)</th><th>P(-20% dip)</th>{head}</tr>' + "".join(rows) + "</table>")
-    parts.append('<div class="dim">Restated at the live quote from the last full simulation: the return distribution '
-                 'and the rating are recomputed hourly; prices scale with the quote in between. P(reach) is the chance '
-                 'the price dips to a level below the quote, or rises to one above it, before the horizon.</div></div>')
+    parts.append('<div class="dim">Prices come from the last full run, rescaled to the live price in between runs (full '
+                 'runs are hourly in the session); leverage cost, drawdown risk, P(up) and P(-20% dip) change only with a '
+                 f'full run. The levels compare today with the months {_span(_period(live))}: low, normal and high (or '
+                 'elevated) are the bottom, middle and top third of them. P(reach) is the chance the price dips to a level '
+                 'below the quote, or rises to one above it, before the horizon. This is not a buy or sell signal.'
+                 '</div></div>')
     return "".join(parts)
+
+
+def _assessment_line(a) -> str:
+    """'leverage cost normal · drawdown risk elevated', each with its number, then a separator; empty
+    for a live.json written before the assessment existed (or one this cannot read)."""
+    try:
+        lev, dd = a["leverage"], a["drawdown"]
+        levels = html.escape(str(lev["level"])), html.escape(str(dd["level"]))
+    except (KeyError, TypeError, IndexError):
+        return ""
+    hurdle, p = lev.get("hurdle"), dd.get("p_dip20_3m")
+    lc = (f' <span class="dim">(the S&amp;P 500 needs {hurdle:.1%}/yr for SPXL to break even over the long run)</span>'
+          if isinstance(hurdle, (int, float)) else "")
+    dip = (f' <span class="dim">({p:.0%} chance of a fall of 20% or more within 3 months)</span>'
+           if isinstance(p, (int, float)) else "")
+    return (f'leverage cost <b class="lvl">{levels[0]}</b>{lc} &middot; drawdown risk <b class="lvl">{levels[1]}</b>{dip}'
+            ' &nbsp;|&nbsp; ')
+
+
+def _period(live: dict):
+    a = live.get("assessment")
+    return a.get("period") if isinstance(a, dict) else None
+
+
+def _span(period) -> str:
+    """'1990-01..2026-08' -> 'from 1990 to 2026' (as report._span)."""
+    try:
+        a, b = str(period).split("..")
+        return f"from {int(a[:4])} to {int(b[:4])}"
+    except (TypeError, ValueError):
+        return "of the backtest"
 
 
 def _check_cell(row: dict, spot: float) -> str:

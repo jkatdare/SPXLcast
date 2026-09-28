@@ -54,10 +54,13 @@ class ETFParams:
         return 0.5 * self.leverage * (self.leverage - 1.0) * sigma_annual ** 2
 
     def breakeven_index_return(self, sigma_annual: float) -> float:
-        """Arithmetic annual index total return at which the fund's MEDIAN return is zero.
+        """Arithmetic annual index total return at which the fund's expected log growth is zero: its
+        long-run break-even.
 
         The fund's log return is L*ln(1+r) - cost - 0.5*L^2*sigma^2 per year with r the arithmetic
-        index return, so the median is flat when ln(1+r) = cost/L + 0.5*L*sigma^2. (Using the
+        index return, so it is zero on average when ln(1+r) = cost/L + 0.5*L*sigma^2; at a constant vol
+        the median is then flat too, while with the simulation's bursts of volatility the 1-year median
+        sits higher and only approaches flat over longer holds. (Using the
         geometric drag L(L-1)/2*sigma^2 alone understates this by 0.5*sigma^2, the index's own
         Ito term.)
         """

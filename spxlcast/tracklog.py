@@ -5,8 +5,9 @@ Every row stores the inputs that drove the forecast and the predicted quantiles 
 at each horizon. ``score_log`` then looks up the realised price ``h`` sessions after each row's
 spot date and reports, per horizon, where realised outcomes fell in the predicted distribution
 (PIT), how often the 5-95% and 25-75% bands covered them, and whether the predicted chances of
-touching -20% / +20% matched reality. It also measures whether the news score had any relation to
-the next two weeks of returns, which is the calibration the sentiment channel currently lacks.
+touching -20% / +20% matched reality, and, by the drawdown-risk level the page showed, how often
+a 20% dip within 3 months actually followed. It also measures whether the news score had any relation
+to the next two weeks of returns, which is the calibration the sentiment channel currently lacks.
 
 Each row also records the model version, the build (git commit) and any data problems of that run
 (``data_flags``, empty when clean), so results can be scored per model version and runs on bad
@@ -40,6 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .assess import DIP_HORIZON, DRAWDOWN_LEVELS, level_of, load_reference
 from .config import MODEL_VERSION, Config, nyse_session
 from .env import build_id
 from .evaluation import (crps_quantiles, effective_n, mean_interval, naive_leveraged_lognormal, normal_quantiles,
@@ -52,7 +54,7 @@ DEFAULT_LOG = os.path.join("logs", "forecast_log.csv")
 MIN_INDEPENDENT = 3
 # columns read as text; every other column is numeric, and a malformed cell becomes NaN
 TEXT_COLUMNS = ("run_at", "spot_date", "spot_status", "model_version", "build", "data_flags", "rating",
-                "conviction", "horizons")
+                "conviction", "leverage_cost", "drawdown_risk", "horizons")
 # the price download failed: `score` exits non-zero, so the job keeps the last good track record
 NO_PRICES = "no price history available to score against"
 
@@ -65,6 +67,7 @@ def forecast_row(fc) -> Dict[str, object]:
     """Flatten a Forecast into one CSV row."""
     sim = fc.sim
     dq = fc.data_quality()
+    a = getattr(fc, "assessment", None)
     row: Dict[str, object] = {
         "run_at": fc.snap.asof.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "spot_date": fc.spot_date,
@@ -79,6 +82,10 @@ def forecast_row(fc) -> Dict[str, object]:
         "score": round(fc.rating.score, 4),
         "score_se": round(fc.rating.score_se, 4),
         "conviction": fc.rating.conviction,
+        # the assessment the page showed (assess.py); levels are n/a when reference.json was missing
+        "hurdle": round(a.leverage.hurdle, 5) if a is not None else "",
+        "leverage_cost": a.leverage.level if a is not None else "",
+        "drawdown_risk": a.drawdown.level if a is not None else "",
         "index_drift": round(fc.expected.final, 5),
         "rf_3m": round(fc.macro.rf_3m, 5),
         "annual_cost": round(fc.etf.annual_cost, 5),
@@ -254,12 +261,27 @@ class ScoreReport:
     first_date: Optional[str]
     last_date: Optional[str]
     horizons: List[HorizonScore] = field(default_factory=list)
-    by_rating: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # drawdown-risk level -> n, n_eff, pred, real, real_ci (90%, Wilson on n_eff) and the backtest's
+    # backtest_pred / backtest_real at that level, for the 20% dip within DIP_HORIZON sessions
+    by_drawdown_risk: Dict[str, Dict[str, object]] = field(default_factory=dict)
     sentiment_corr: Optional[float] = None
     sentiment_n: int = 0
     notes: List[str] = field(default_factory=list)
     versions: Dict[str, int] = field(default_factory=dict)   # rows per model version in the whole log
     model_version: Optional[str] = None                      # the version scored, when filtered
+
+
+def _float(v) -> float:
+    return float(v) if isinstance(v, (int, float)) else float("nan")
+
+
+def _drawdown_level(row, cutoffs) -> str:
+    """The drawdown-risk level a row showed; for a row logged before the column existed (or without a
+    reference then), its logged 3-month dip chance placed against the reference's cutoffs."""
+    logged = row.get("drawdown_risk")
+    if isinstance(logged, str) and logged in DRAWDOWN_LEVELS:
+        return logged
+    return level_of(row.get(_h(DIP_HORIZON, "p_dd20")), cutoffs, DRAWDOWN_LEVELS)
 
 
 def _pit(realised: float, quantiles: Dict[int, float]) -> float:
@@ -386,6 +408,10 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
         basis[implausible] = np.nan
 
     horizons = sorted({int(h) for hs in df["horizons"].fillna("").astype(str) for h in hs.split() if h.isdigit()})
+    ref = load_reference()
+    dd_ref = ref.get("p_dip20_3m") if ref is not None else None
+    dd_ref = dd_ref if isinstance(dd_ref, dict) else {}
+    ref_by_level = dd_ref.get("by_level") if isinstance(dd_ref.get("by_level"), dict) else {}
     scored_any = set()
     pending = []                            # (sessions still to go, horizon, spot date) of unresolved rows
     grid_cache: Dict[str, Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]]] = {}
@@ -443,7 +469,7 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
                 "real_dd20": float(path_vals.min() <= 0.8 * spot),
                 "pred_up20": float(row.get(_h(h, "p_up20"), np.nan)),
                 "real_up20": float(path_vals.max() >= 1.2 * spot),
-                "rating": row["rating"],
+                "dd_level": _drawdown_level(row, dd_ref.get("cutoffs")) if h == DIP_HORIZON else None,
                 "crps_model": crps_quantiles(levels, qv, y),
                 "crps_naive": crps_naive,
                 "fine": grid is not None,
@@ -476,10 +502,17 @@ def score_log(path: str = DEFAULT_LOG, closes: Optional[pd.Series] = None, cfg: 
                            if n_eff_both >= MIN_INDEPENDENT else nan2),
             n_fine=int(g["fine"].sum()), n_crps=int(len(both)),
         ))
-        if h == cfg.rating_horizon:
-            for label, gg in g.groupby("rating"):
-                report.by_rating[str(label)] = {"n": int(len(gg)), "mean_return": float(gg["ret"].mean()),
-                                                "p_positive": float((gg["ret"] > 0).mean())}
+        if h == DIP_HORIZON:
+            for label in DRAWDOWN_LEVELS:
+                gg = g[g["dd_level"] == label]
+                if not len(gg):
+                    continue
+                n_eff_l, real = effective_n(gg["pos"].values, h), float(gg["real_dd20"].mean())
+                hist = ref_by_level.get(label) if isinstance(ref_by_level.get(label), dict) else {}
+                report.by_drawdown_risk[label] = {
+                    "n": int(len(gg)), "n_eff": n_eff_l, "pred": float(gg["pred_dd20"].mean()), "real": real,
+                    "real_ci": proportion_interval(real, n_eff_l) if n_eff_l >= MIN_INDEPENDENT else nan2,
+                    "backtest_pred": _float(hist.get("pred")), "backtest_real": _float(hist.get("real"))}
     report.n_scoreable = len(scored_any)
 
     # News sentiment vs the next 10 sessions of SPXL return.

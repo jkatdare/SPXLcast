@@ -1,0 +1,8 @@
+SPXL timing-signal search: frozen test specification hash
+frozen_utc: 2026-09-27T17:48:48Z
+algorithm: SHA-256 of the file's bytes as written (UTF-8, LF line endings; research/.gitattributes keeps LF in every checkout)
+
+c02bbd667e56782a2b4a0e6dcaad93de77a72de4338e048ce32a351047226fed  research/frozen_spec.json
+
+output/research/train_params.json holds the same bytes (the plan's name; its hash is in research/TRAIN_REPORT.md)
+verify: sha256sum research/frozen_spec.json output/research/train_params.json
