@@ -1,4 +1,10 @@
-FROM python:3.12-slim
+# One exact Python release on one Debian release, so a rebuild cannot silently change either: the
+# plain 3.12-slim tag moves to every new 3.12.x and, as in 2025, to a new Debian release. 3.12.14 on
+# Debian 13 (trixie) is what 3.12-slim pointed to when this was pinned. Docker Hub rebuilds this tag
+# with Debian security fixes only until the next 3.12.x comes out (the 3.12.13 tag stopped on
+# 2026-08-07); after that it never changes. So when a new 3.12.x appears, move up: change the tag
+# here and python-version in .github/workflows/deploy.yml, run the tests, commit.
+FROM python:3.12.14-slim-trixie
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \

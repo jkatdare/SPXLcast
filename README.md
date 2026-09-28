@@ -20,11 +20,18 @@ All market data comes from Yahoo Finance through `yfinance`; FRED is optional.
 
 ## Install
 
-Python 3.10+.
+Python 3.12 or newer (the pinned numpy and scipy need it).
 
 ```bash
 pip install -r requirements.txt
 ```
+
+`requirements.txt` pins each package it lists to one exact version, so a new release of pandas,
+numpy or the others cannot silently change the numbers (packages those pull in themselves are not
+pinned). To update one: change its version there, run `pip install -r requirements.txt` and the
+tests (`python -m pytest -q`), and commit if they pass; the next deploy picks it up. The live site's
+Python is pinned the same way, on the `FROM` line of `Dockerfile`, and the tests before each deploy run
+on that same Python (`python-version` in `.github/workflows/deploy.yml`; change both together).
 
 ## Use
 
@@ -306,6 +313,12 @@ python scripts/backtest_rating.py                       # the full model, the ra
 python scripts/backtest_rating.py --write-reference     # ... and copy its levels to spxlcast/reference.json
 ```
 
+`tests/test_golden.py` runs the whole model on a fixed made-up market and checks its numbers against
+`tests/golden/forecast_golden.json`, which also records the `MODEL_VERSION` it was made with. If a
+change moves those numbers, the test fails until you bump `MODEL_VERSION` in `spxlcast/config.py` and
+then regenerate the file with `python tests/test_golden.py`, which will not overwrite changed numbers
+without the bump.
+
 **Engine calibration.** The first script builds the model's inputs at every month-end since 2016
 from data available then, simulates with the project's own engine, and scores the realised outcome
 over the next 1, 3 and 6 months. With the current settings (10 years, 114 origins, constant 7%
@@ -350,7 +363,8 @@ about 73 independent ones), the same construction as the track record's. Finding
   91-93% of outcomes from one week to six months, and the model's CRPS is 3% (1 week) to 15%
   (6 months) better than a lognormal at the raw VIX with a T-bill drift, with 90% intervals above
   zero at every horizon. The median is slightly low (mean PIT 0.54-0.57) and the chance of a 20%
-  dip is overstated by 4-6 points at 3-6 months.
+  dip is overstated by 4-6 points at 3-6 months, and by about as much (4-5 points) on SPXL itself
+  since 2009 (see Dip-odds recalibration below).
 * The fundamentals drift adds nothing measurable at these horizons: against the same engine with
   a constant 7% drift, 6-month skill is +0.4% (90% interval -0.9% to +1.7%). Valuation predicts
   5-10 year returns (above), not the next six months.
@@ -398,4 +412,20 @@ three independent reviews, and the limitations are in [research/RESULTS.md](rese
 
 ```bash
 python scripts/research_signals.py report   # regenerates research/test_results.md and research/RESULTS.md
+```
+
+### Dip-odds recalibration
+
+A second fixed-in-advance study ([research/CALIBRATION.md](research/CALIBRATION.md)) tried 15 settings
+of the VIX haircuts and the stochastic-vol size to bring the 20% dip chances down, chosen on 1990-2007
+and to be checked once on 2008-2026. **Nothing changed**: every alternative failed a safety rule set in
+advance (1-month ranges holding at most 94% of outcomes; all settings held 94.3% in 1990-2007), so the
+rule kept today's setting. The overstatement was largest before 2008 (3 months: 25.7% predicted, 19.0%
+happened) but has not gone away: on SPXL itself since 2009 a 20% fall within 3 months was predicted
+25.8% of the time and happened 22.0% (6 months: 37.4% against 32.0%). 2008-2026 as a whole looks close
+(26.8% against 25.3%) only because the 2008 crash brought far more falls than predicted. Every number
+is in [research/calibration_results.md](research/calibration_results.md).
+
+```bash
+python scripts/backtest_rating.py --engine-grid research/calibration_grid.json --end 2007-06 --paths 10000 --tag train
 ```

@@ -65,6 +65,12 @@ def test_schedules_agree_across_workflows_scripts_and_docs():
     assert "if: steps.check.outcome == 'success' && steps.check.outputs.live_checked == 'true'" in hc
 
 
+def test_the_tests_before_a_deploy_run_on_the_python_the_image_ships():
+    image = re.search(r"^FROM python:(\d+\.\d+\.\d+)-", (ROOT / "Dockerfile").read_text(encoding="utf-8"), re.M)
+    deploy = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    assert image and re.search(r'python-version:\s*"([^"]+)"', deploy).group(1) == image.group(1)
+
+
 def test_every_run_is_judged_by_two_checks_so_a_dropped_or_late_check_loses_nothing():
     mon, next_tue = datetime(2026, 9, 28, tzinfo=UTC), datetime(2026, 10, 6, tzinfo=UTC)
     week = scheduled_runs(mon, mon + timedelta(days=5))

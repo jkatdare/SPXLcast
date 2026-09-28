@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "spxlcast"
 version = "0.2.0"
 description = "Fundamentals-driven price distribution forecast for SPXL (3x S&P 500): leverage cost, drawdown risk and price percentiles"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "yfinance>=0.2.50",
     "pandas>=2.0",

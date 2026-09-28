@@ -1,10 +1,12 @@
-yfinance>=0.2.50
-pandas>=2.0
-numpy>=1.26
-scipy>=1.11
-requests>=2.31
-vaderSentiment>=3.3
-rich>=13.0
-matplotlib>=3.8
-pytest>=8.0
-xlrd>=2.0
+# Exact versions, so every install and every production build gets the same versions of these.
+# To update one: change its version here, run the tests, commit (see README, "Install").
+yfinance==1.7.0
+pandas==3.0.6
+numpy==2.5.3
+scipy==1.18.1
+requests==2.34.2
+vaderSentiment==3.3.2
+rich==15.0.0
+matplotlib==3.11.2
+pytest==9.1.1
+xlrd==2.0.2

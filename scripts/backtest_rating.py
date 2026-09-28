@@ -37,13 +37,22 @@ Reported:
    information only, forward returns by leverage-cost level. These go to reference.json, which
    ``--write-reference`` also copies into the package for the live page.
 
-Usage:  py scripts/backtest_rating.py [--paths 20000] [--start 1990-01] [--term-structure impute]
+``--engine-grid FILE`` compares engine settings instead (research/CALIBRATION.md): for each setting
+in the JSON file it runs only the model's simulation at each month-end (no rating, no constant-drift
+twin) and reports, per horizon, the Brier score of the 20% dip, CRPS and band coverage, the
+pre-registered guardrails and the setting the rule picks. It writes engine_<tag>.txt and .csv and
+leaves the backtest's own outputs alone.
+
+Usage:  py scripts/backtest_rating.py [--paths 20000] [--start 1990-01] [--end 2026-08] [--term-structure impute]
         [--refresh]   (re-download Yahoo, FRED and Shiller data; otherwise a local cache is used)
         [--write-reference]   (copy output/backtest/reference.json to spxlcast/reference.json)
+        [--engine-grid research/calibration_grid.json [--only NAME ...] [--tag train]]
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import math
 import shutil
@@ -171,11 +180,14 @@ def validate_synthetic(d: pd.DataFrame) -> Dict[str, float]:
 # ---------------------------------------------------------------------------------------
 # Point-in-time model inputs
 # ---------------------------------------------------------------------------------------
-def month_end_positions(idx: pd.DatetimeIndex, start: str) -> List[int]:
+def month_end_positions(idx: pd.DatetimeIndex, start: str, end: Optional[str] = None) -> List[int]:
+    """Positions of the complete months' last sessions from month ``start`` through month ``end``."""
     s = pd.Series(np.arange(len(idx)), index=idx)
     last = s.groupby([idx.year, idx.month]).max()
     current = (idx[-1].year, idx[-1].month)          # the data's last month is still in progress
-    return [int(p) for p in last.values if idx[p] >= pd.Timestamp(start) and (idx[p].year, idx[p].month) != current]
+    stop = pd.Period(end, "M") if end else None
+    return [int(p) for p in last.values if idx[p] >= pd.Timestamp(start) and (idx[p].year, idx[p].month) != current
+            and (stop is None or idx[p].to_period("M") <= stop)]
 
 
 def released(series: pd.Series, origin: pd.Timestamp) -> pd.Series:
@@ -237,20 +249,45 @@ def inputs_at(d: pd.DataFrame, pos: int, inputs: Dict, cfg: Config, ts_mode: str
 # ---------------------------------------------------------------------------------------
 # One origin
 # ---------------------------------------------------------------------------------------
-def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
+def _model_sim(inp: Dict, cfg: Config):
+    """The live model's simulation at one origin: (expected return, vol term structure, financing,
+    annual cost, simulator arguments without the drift, simulation)."""
     macro, fund = inp["macro"], inp["fund"]
     expected = expected_index_return(fund, macro, cfg)
     T = max(HORIZONS)
     vol = vol_term_structure(macro, MarketSnapshot(asof=datetime.now(timezone.utc)), cfg, T)
     financing = (cfg.leverage_target - 1) * (macro.rf_3m + cfg.swap_spread)
     annual_cost = cfg.expense_ratio_default + financing
-    lc = leverage_cost(cfg.leverage_target, cfg.expense_ratio_default, financing, sigma_1y(vol), expected.final, None)
     kw = dict(spot=1.0, sigma_annual=vol.daily, leverage=cfg.leverage_target, daily_cost=annual_cost / 252.0,
               tracking_sd_daily=TRACKING_SD, rf_annual=macro.rf_3m, horizons=HORIZONS, n_paths=cfg.n_paths,
               dof=cfg.t_dof, skew_gamma=cfg.skew_gamma, max_daily_move=cfg.max_daily_move, seed=cfg.seed,
               drift_sd_annual=cfg.drift_uncertainty_sd, sv_persistence=cfg.sv_persistence,
               sv_logvol_sd=cfg.sv_logvol_sd, sv_leverage=cfg.sv_leverage)
-    sim = simulate(mu_annual=np.full(T, expected.final), **kw)
+    return expected, vol, financing, annual_cost, kw, simulate(mu_annual=np.full(T, expected.final), **kw)
+
+
+def _fund_window(d: pd.DataFrame, pos: int, h: int) -> np.ndarray:
+    """The realised fund's closes over the h sessions after ``pos``, relative to its close at ``pos``."""
+    fund_level = d["fund"].values
+    return fund_level[pos + 1: pos + h + 1] / fund_level[pos]
+
+
+def _model_scores(sim, window: np.ndarray, h: int) -> Dict:
+    """Where the outcome fell in the model's simulation at h: PIT, band hits, CRPS of the log return,
+    and the predicted and realised 20% dip (lowest close at most 0.8 x the start)."""
+    y = float(np.log(window[-1]))
+    x = np.log(sim.terminal[h])
+    q5, q25, q75, q95 = np.percentile(x, [5, 25, 75, 95])
+    return {f"pit_{h}": float(np.mean(x <= y)), f"in90_{h}": bool(q5 <= y <= q95), f"in50_{h}": bool(q25 <= y <= q75),
+            f"crps_model_{h}": crps_sample(x, y),
+            f"pred_dd20_{h}": float(np.mean(sim.path_min[h] <= 0.8)), f"real_dd20_{h}": float(window.min() <= 0.8)}
+
+
+def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
+    macro, fund = inp["macro"], inp["fund"]
+    expected, vol, financing, annual_cost, kw, sim = _model_sim(inp, cfg)
+    T = max(HORIZONS)
+    lc = leverage_cost(cfg.leverage_target, cfg.expense_ratio_default, financing, sigma_1y(vol), expected.final, None)
     sim7 = simulate(mu_annual=np.full(T, CONSTANT_DRIFT), **kw)
     rating = rate(sim, RATING_H, cfg)
     rating7 = rate(sim7, RATING_H, cfg)
@@ -266,29 +303,204 @@ def run_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
            "label_const7": rating7.label, "score_const7": rating7.score,
            "hurdle": lc.hurdle, "lc_fees": lc.fees, "lc_financing": lc.financing, "lc_drag": lc.drag,
            "sigma_1y": lc.sigma, "p_dip20_3m": sim.summary(DIP_HORIZON)["p_drawdown_20"]}
-    fund_level = d["fund"].values
     for h in HORIZONS:
         if pos + h >= len(d):
             continue
-        start = fund_level[pos]
-        window = fund_level[pos + 1: pos + h + 1] / start
+        window = _fund_window(d, pos, h)
         y = float(np.log(window[-1]))
-        x, x7 = np.log(sim.terminal[h]), np.log(sim7.terminal[h])
-        q5, q25, q75, q95 = np.percentile(x, [5, 25, 75, 95])
+        ms = _model_scores(sim, window, h)
         m, s = naive_leveraged_lognormal(macro.vix, macro.rf_3m, annual_cost, h, cfg.leverage_target)
         tbill = float(np.prod(1.0 + d["tbill_ret"].values[pos + 1: pos + h + 1]) - 1.0)
         rec.update({
             f"ret_{h}": float(window[-1] - 1.0), f"tbill_{h}": tbill, f"excess_{h}": float(window[-1] - 1.0 - tbill),
             f"sp_{h}": float(d["tr"].values[pos + h] / d["tr"].values[pos] - 1.0),
-            f"pit_{h}": float(np.mean(x <= y)), f"in90_{h}": bool(q5 <= y <= q95), f"in50_{h}": bool(q25 <= y <= q75),
-            f"crps_model_{h}": crps_sample(x, y), f"crps_const7_{h}": crps_sample(x7, y),
+            **{k: ms[k] for k in (f"pit_{h}", f"in90_{h}", f"in50_{h}", f"crps_model_{h}")},
+            f"crps_const7_{h}": crps_sample(np.log(sim7.terminal[h]), y),
             f"crps_naive_{h}": crps_normal(m, s, y),
-            f"pred_dd20_{h}": float(np.mean(sim.path_min[h] <= 0.8)), f"real_dd20_{h}": float(window.min() <= 0.8),
+            f"pred_dd20_{h}": ms[f"pred_dd20_{h}"], f"real_dd20_{h}": ms[f"real_dd20_{h}"],
         })
         if h == RATING_H:   # realised fund cost + volatility drag per year: L x index log return - fund log return
             rec["real_cost"] = (cfg.leverage_target * float(np.log(d["tr"].values[pos + h] / d["tr"].values[pos]))
                                 - y) * 252.0 / h
     return rec
+
+
+def engine_origin(d: pd.DataFrame, pos: int, inp: Dict, cfg: Config) -> Dict:
+    """The model's simulation alone at one origin, scored at every horizon with an outcome: all an
+    engine-setting comparison needs (no rating, no constant-drift twin)."""
+    sim = _model_sim(inp, cfg)[-1]
+    rec = {"date": d.index[pos], "pos": pos}
+    for h in HORIZONS:
+        if pos + h < len(d):
+            rec.update(_model_scores(sim, _fund_window(d, pos, h), h))
+    return rec
+
+
+# ---------------------------------------------------------------------------------------
+# Engine settings compared (--engine-grid; the rule is research/CALIBRATION.md's)
+# ---------------------------------------------------------------------------------------
+HLABEL = {5: "1W", 10: "2W", 21: "1M", 63: "3M", 126: "6M"}
+
+
+def load_grid(path: Path) -> Dict:
+    """The settings file: {"reference": name, "settings": {name: {Config field: value}}, "rule": {...}}."""
+    grid = json.loads(Path(path).read_text(encoding="utf-8"))
+    fields = {f.name for f in dataclasses.fields(Config)}
+    for name, over in grid["settings"].items():
+        unknown = set(over) - fields
+        if unknown:
+            raise SystemExit(f"setting {name!r}: {sorted(unknown)} are not Config fields")
+    if grid["reference"] not in grid["settings"]:
+        raise SystemExit(f"the reference setting {grid['reference']!r} is not in the settings")
+    return grid
+
+
+def engine_config(base: Config, overrides: Dict) -> Config:
+    return dataclasses.replace(base, **{k: tuple(v) if isinstance(v, list) else v for k, v in overrides.items()})
+
+
+def engine_table(o: pd.DataFrame, rule: Dict, reference: str) -> pd.DataFrame:
+    """One row per setting: Brier score of the 20% dip, CRPS and 90% band coverage per horizon, the
+    guardrails against the reference setting, and the rule's pick (lowest mean Brier score among the
+    settings within the guardrails; the reference always counts and wins an exact tie)."""
+    bh, ch, vh = rule["brier_horizons"], rule["crps_horizons"], rule["coverage_horizons"]
+    lo, hi = rule["coverage_range"]
+    rows = []
+    for name, g in o.groupby("setting", sort=False):
+        r = {"setting": name}
+        for h in sorted(set(bh) | set(ch) | set(vh)):
+            e = g.dropna(subset=[f"pit_{h}"])
+            r[f"n_{h}"] = len(e)
+            r[f"brier_{h}"] = float(((e[f"pred_dd20_{h}"] - e[f"real_dd20_{h}"]) ** 2).mean())
+            r[f"pred_{h}"], r[f"real_{h}"] = float(e[f"pred_dd20_{h}"].mean()), float(e[f"real_dd20_{h}"].mean())
+            r[f"crps_{h}"] = float(e[f"crps_model_{h}"].mean())
+            r[f"cov90_{h}"], r[f"cov50_{h}"] = float(e[f"in90_{h}"].mean()), float(e[f"in50_{h}"].mean())
+            r[f"pit_{h}"] = float(e[f"pit_{h}"].mean())
+        r["brier_mean"] = float(np.mean([r[f"brier_{h}"] for h in bh]))
+        rows.append(r)
+    t = pd.DataFrame(rows).set_index("setting")
+    ref = t.loc[reference]
+    for h in ch:
+        t[f"crps_vs_ref_{h}"] = t[f"crps_{h}"] / ref[f"crps_{h}"] - 1.0
+    t["g1_crps"] = np.all([t[f"crps_vs_ref_{h}"] <= rule["crps_tolerance"] for h in ch], axis=0)
+    t["g2_coverage"] = np.all([(t[f"cov90_{h}"] >= lo) & (t[f"cov90_{h}"] <= hi) for h in vh], axis=0)
+    t["eligible"] = (t["g1_crps"] & t["g2_coverage"]) | (t.index == reference)
+    order = t[t["eligible"]].assign(is_ref=lambda x: x.index != reference).sort_values(["brier_mean", "is_ref"])
+    t["rank"] = pd.Series(np.arange(1, len(order) + 1), index=order.index).reindex(t.index)
+    t.attrs["pick"] = order.index[0]
+    return t
+
+
+def brier_diff(o: pd.DataFrame, name: str, reference: str, h: int) -> tuple:
+    """Mean Brier-score difference of ``name`` minus ``reference`` at h over the same origins, with
+    an overlap-aware 90% interval (for information; the rule does not use it)."""
+    cols = ["pos", f"pred_dd20_{h}", f"real_dd20_{h}"]
+    a = o.loc[o["setting"] == name, cols].dropna().set_index("pos")
+    b = o.loc[o["setting"] == reference, cols].dropna().set_index("pos").reindex(a.index)
+    diff = (a[f"pred_dd20_{h}"] - a[f"real_dd20_{h}"]) ** 2 - (b[f"pred_dd20_{h}"] - b[f"real_dd20_{h}"]) ** 2
+    return (float(diff.mean()), *mean_interval(diff.values, effective_n(a.index, h)))
+
+
+def engine_report(o: pd.DataFrame, grid: Dict) -> List[str]:
+    rule, reference = grid["rule"], grid["reference"]
+    bh, ch, vh = rule["brier_horizons"], rule["crps_horizons"], rule["coverage_horizons"]
+    lo, hi = rule["coverage_range"]
+    t = engine_table(o, rule, reference)
+    names = list(t.index)
+    out = [f"Reference setting (the guardrails compare with it): {reference}", "",
+           "Brier score of the 20% dip (lower is better; the objective is the mean over "
+           + "/".join(HLABEL[h] for h in bh) + "), and the chance predicted / how often it happened"]
+    rows = []
+    for n in names:
+        r = t.loc[n]
+        rows.append({"setting": n, **{f"Brier {HLABEL[h]}": f"{r[f'brier_{h}']:.4f}" for h in bh},
+                     "mean": f"{r['brier_mean']:.5f}",
+                     **{f"dip {HLABEL[h]} pred/real": f"{r[f'pred_{h}']:.1%} / {r[f'real_{h}']:.1%}" for h in bh}})
+    out.append(pd.DataFrame(rows).to_string(index=False))
+
+    out.append("\nBrier score minus the reference's, same month-ends [90% CI, overlap-aware; information only]")
+    rows = []
+    for n in names:
+        rec = {"setting": n}
+        for h in bh:
+            m, a, b = brier_diff(o, n, reference, h)
+            rec[HLABEL[h]] = "0 (reference)" if n == reference else f"{m:+.4f} {_ci(a, b, '{:+.4f}')}"
+        rows.append(rec)
+    out.append(pd.DataFrame(rows).to_string(index=False))
+
+    out.append(f"\nCRPS of the fund's log return (lower is better) and its change from the reference's "
+               f"(guardrail G1: at most {rule['crps_tolerance']:+.1%} at each of " + "/".join(HLABEL[h] for h in ch) + ")")
+    out.append(pd.DataFrame([{"setting": n, **{HLABEL[h]: f"{t.at[n, f'crps_{h}']:.4f} ({t.at[n, f'crps_vs_ref_{h}']:+.2%})"
+                                               for h in ch}} for n in names]).to_string(index=False))
+
+    out.append(f"\n90% band coverage (guardrail G2: {lo:.0%} to {hi:.0%} at each of " + "/".join(HLABEL[h] for h in vh)
+               + "); 50% band and mean PIT at 3M for information")
+    out.append(pd.DataFrame([{"setting": n, **{HLABEL[h]: f"{t.at[n, f'cov90_{h}']:.1%}" for h in vh},
+                              "50% band 3M": f"{t.at[n, 'cov50_63']:.1%}" if "cov50_63" in t else "",
+                              "mean PIT 3M": f"{t.at[n, 'pit_63']:.3f}" if "pit_63" in t else ""}
+                             for n in names]).to_string(index=False))
+
+    out.append("\nGuardrails and rule (the reference always counts; ranked by the mean Brier score)")
+    out.append(pd.DataFrame([{"setting": n, "G1 CRPS": "ok" if t.at[n, "g1_crps"] else "fails",
+                              "G2 coverage": "ok" if t.at[n, "g2_coverage"] else "fails",
+                              "counts": "yes" if t.at[n, "eligible"] else "no",
+                              "rank": "" if pd.isna(t.at[n, "rank"]) else f"{int(t.at[n, 'rank'])}"}
+                             for n in names]).to_string(index=False))
+    n_obs = ", ".join(f"{HLABEL[h]} {int(t[f'n_{h}'].iloc[0])}" for h in sorted(set(bh) | set(vh)))
+    out.append(f"(month-ends with an outcome: {n_obs})")
+    out.append(f"\nThe rule picks: {t.attrs['pick']}"
+               + (" (the reference: no change)" if t.attrs["pick"] == reference else ""))
+    return out
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def run_engine_grid(args, out_dir: Path, d: pd.DataFrame, inputs: Dict, fits: Dict, positions: List[int]) -> None:
+    grid = load_grid(args.engine_grid)
+    names = list(grid["settings"])
+    if args.only:
+        missing = [n for n in args.only if n not in grid["settings"]]
+        if missing:
+            raise SystemExit(f"--only: {missing} not in {args.engine_grid}")
+        names = [n for n in names if n in args.only]
+    if grid["reference"] not in names:
+        raise SystemExit(f"the reference setting {grid['reference']!r} must be run too")
+    base = Config(n_paths=args.paths, use_news=False, horizons=tuple(HORIZONS), rating_horizon=RATING_H)
+    origins = [(pos, inputs_at(d, pos, inputs, base, args.term_structure, fits)) for pos in positions]
+    origins = [(pos, inp) for pos, inp in origins if inp is not None]
+    if not origins:
+        raise SystemExit("no month-end had the inputs the model needs")
+    rule = grid["rule"]
+    short = sorted(h for h in set(rule["brier_horizons"]) | set(rule["crps_horizons"]) | set(rule["coverage_horizons"])
+                   if origins[0][0] + h >= len(d))
+    if short:
+        raise SystemExit("no month-end in the window has an outcome at " + "/".join(HLABEL.get(h, str(h)) for h in short)
+                         + " yet: use an earlier --start")
+    rows, t0 = [], time.time()
+    for i, name in enumerate(names):
+        cfg = engine_config(base, grid["settings"][name])
+        # inputs rebuilt per setting: they depend on the Config (earnings growth); which month-ends
+        # have inputs does not
+        rows += [{"setting": name, **engine_origin(d, pos, inputs_at(d, pos, inputs, cfg, args.term_structure, fits), cfg)}
+                 for pos, _ in origins]
+        print(f"  {i + 1}/{len(names)} {name} ({time.time() - t0:.0f}s)", flush=True)
+    o = pd.DataFrame(rows)
+    tag = args.tag or "grid"
+    o.to_csv(out_dir / f"engine_{tag}.csv", index=False)
+    first, last = d.index[origins[0][0]], d.index[origins[-1][0]]
+    lines = [f"SPXLcast engine settings compared, run {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC",
+             f"{len(origins)} month-ends {first:%Y-%m} .. {last:%Y-%m} ({first.date()} .. {last.date()}); "
+             f"{args.paths} paths per simulation, seed {base.seed}; model simulation only; "
+             f"VIX term structure before 2008: {args.term_structure}",
+             f"settings: {args.engine_grid} (SHA-256 {_sha256(args.engine_grid)[:16]}...), {len(names)} run; "
+             f"inputs: rating_inputs.pkl (SHA-256 {_sha256(out_dir / 'rating_inputs.pkl')[:16]}...)",
+             "", *engine_report(o, grid)]
+    report = "\n".join(lines)
+    (out_dir / f"engine_{tag}.txt").write_text(report + "\n", encoding="utf-8")
+    print(report)
+    print(f"\nwrote {out_dir / f'engine_{tag}.txt'} and engine_{tag}.csv ({time.time() - t0:.0f}s)")
 
 
 # ---------------------------------------------------------------------------------------
@@ -646,10 +858,14 @@ def run(args) -> None:
     inputs = load_inputs(out_dir, args.refresh)
     d = build_daily(inputs, cfg)
     fits = fit_term_structure(d)
-    val = validate_synthetic(d)
-    positions = month_end_positions(d.index, args.start)
+    end = getattr(args, "end", None)
+    positions = month_end_positions(d.index, args.start, end)
     if not positions:
-        raise SystemExit(f"no complete month-end on or after --start {args.start}")
+        raise SystemExit(f"no complete month-end on or after --start {args.start}" + (f" through --end {end}" if end else ""))
+    if getattr(args, "engine_grid", None):
+        run_engine_grid(args, out_dir, d, inputs, fits, positions)
+        return
+    val = validate_synthetic(d)
     print(f"{len(positions)} month-ends {d.index[positions[0]].date()} .. {d.index[positions[-1]].date()}, "
           f"{args.paths} paths, term structure before 2008: {args.term_structure}", flush=True)
     rows, skipped, t0 = [], [], time.time()
@@ -724,7 +940,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--paths", type=int, default=20000)
     ap.add_argument("--start", default="1990-01")
+    ap.add_argument("--end", default=None, help="last month-end origin, YYYY-MM (default: the last complete month)")
     ap.add_argument("--term-structure", choices=("impute", "flat"), default="impute")
+    ap.add_argument("--engine-grid", default=None, metavar="FILE",
+                    help="compare the engine settings in this JSON file (model simulation only; see "
+                         "research/CALIBRATION.md) instead of running the full backtest")
+    ap.add_argument("--only", nargs="+", default=None, metavar="NAME", help="with --engine-grid: only these settings")
+    ap.add_argument("--tag", default=None, help="with --engine-grid: output names engine_<tag>.txt/.csv (default grid)")
     ap.add_argument("--refresh", action="store_true", help="re-download the input data")
     ap.add_argument("--write-reference", action="store_true",
                     help="also copy reference.json into the package (spxlcast/reference.json), where the page reads it")

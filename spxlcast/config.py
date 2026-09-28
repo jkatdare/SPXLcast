@@ -13,6 +13,8 @@ from typing import FrozenSet, Optional, Tuple
 # Version of the forecasting model, logged with every track-record row so results can be scored per
 # version. Bump it whenever a change alters the numbers a run produces (inputs, assumptions, the
 # simulation, the rating); pure plumbing, reporting or extra horizons do not need a bump.
+# tests/test_golden.py fails when the numbers on its made-up market change and this does not (caps,
+# floors, cut-offs and fallbacks that market never reaches are not checked).
 MODEL_VERSION = "0.3.0"
 
 

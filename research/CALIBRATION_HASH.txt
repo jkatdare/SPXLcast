@@ -1,0 +1,8 @@
+SPXLcast dip-odds recalibration: pre-registration hashes
+frozen_utc: 2026-09-28T19:42:31Z
+algorithm: SHA-256 of the files' bytes as written (UTF-8, LF line endings; research/.gitattributes keeps LF in every checkout)
+
+0eef9e3e3c6888105480339ae50781b93ceaeb541889ba01a119543cf24421be  research/CALIBRATION.md
+1a0ba7d96aae7cc68ee2d398fca0d965fd0c447e57736f435e96aafa878abfa0  research/calibration_grid.json
+
+verify: sha256sum research/CALIBRATION.md research/calibration_grid.json

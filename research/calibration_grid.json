@@ -1,0 +1,180 @@
+{
+ "document": "research/CALIBRATION.md (governs if the two disagree)",
+ "reference": "vrp 3/5/7, sv 0.35",
+ "settings": {
+  "vrp 3/5/7, sv 0.25": {
+   "vrp_vol_points": [
+    3.0,
+    5.0,
+    7.0
+   ],
+   "sv_logvol_sd": 0.25
+  },
+  "vrp 3/5/7, sv 0.35": {
+   "vrp_vol_points": [
+    3.0,
+    5.0,
+    7.0
+   ],
+   "sv_logvol_sd": 0.35
+  },
+  "vrp 3/5/7, sv 0.45": {
+   "vrp_vol_points": [
+    3.0,
+    5.0,
+    7.0
+   ],
+   "sv_logvol_sd": 0.45
+  },
+  "vrp 3/6/8, sv 0.25": {
+   "vrp_vol_points": [
+    3.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.25
+  },
+  "vrp 3/6/8, sv 0.35": {
+   "vrp_vol_points": [
+    3.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.35
+  },
+  "vrp 3/6/8, sv 0.45": {
+   "vrp_vol_points": [
+    3.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.45
+  },
+  "vrp 3/7/9, sv 0.25": {
+   "vrp_vol_points": [
+    3.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.25
+  },
+  "vrp 3/7/9, sv 0.35": {
+   "vrp_vol_points": [
+    3.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.35
+  },
+  "vrp 3/7/9, sv 0.45": {
+   "vrp_vol_points": [
+    3.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.45
+  },
+  "vrp 4/6/8, sv 0.25": {
+   "vrp_vol_points": [
+    4.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.25
+  },
+  "vrp 4/6/8, sv 0.35": {
+   "vrp_vol_points": [
+    4.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.35
+  },
+  "vrp 4/6/8, sv 0.45": {
+   "vrp_vol_points": [
+    4.0,
+    6.0,
+    8.0
+   ],
+   "sv_logvol_sd": 0.45
+  },
+  "vrp 4/7/9, sv 0.25": {
+   "vrp_vol_points": [
+    4.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.25
+  },
+  "vrp 4/7/9, sv 0.35": {
+   "vrp_vol_points": [
+    4.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.35
+  },
+  "vrp 4/7/9, sv 0.45": {
+   "vrp_vol_points": [
+    4.0,
+    7.0,
+    9.0
+   ],
+   "sv_logvol_sd": 0.45
+  }
+ },
+ "fixed": {
+  "sv_persistence": 0.97,
+  "sv_leverage": -0.5,
+  "skew_gamma": 0.9,
+  "t_dof": 4.0,
+  "max_daily_move": 0.2,
+  "drift_uncertainty_sd": 0.02,
+  "vol_floor": 0.08,
+  "long_run_vol": 0.16,
+  "swap_spread": 0.0075,
+  "expected_return_model": "not tuned (0.3.0)"
+ },
+ "windows": {
+  "train": [
+   "1990-01",
+   "2007-06"
+  ],
+  "check": [
+   "2008-01",
+   "2026-08"
+  ]
+ },
+ "paths": {
+  "grid": 10000,
+  "confirm": 20000,
+  "check": 20000
+ },
+ "seed": 42,
+ "rule": {
+  "objective": "mean of the Brier scores of the 20% dip at these horizons (lower is better)",
+  "brier_horizons": [
+   21,
+   63,
+   126
+  ],
+  "crps_horizons": [
+   21,
+   63,
+   126
+  ],
+  "crps_tolerance": 0.005,
+  "coverage_horizons": [
+   5,
+   10,
+   21,
+   63,
+   126
+  ],
+  "coverage_range": [
+   0.87,
+   0.94
+  ],
+  "tie": "the reference setting wins an exact tie"
+ }
+}

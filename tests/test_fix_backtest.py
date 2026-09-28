@@ -1,5 +1,6 @@
 """Regression tests for the backtest-group fixes of the break-it campaign (all offline, synthetic data)."""
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -164,6 +165,98 @@ def test_run_reports_gaps_and_handles_late_or_empty_starts(tmp_path, capsys):
     empty.mkdir()
     with pytest.raises(SystemExit, match="no complete month-end"):
         _run(empty, "2024-01")
+
+
+# ---- engine settings compared (--engine-grid, research/CALIBRATION.md) ---------------------
+def _grid_file(tmp_path, reference="base"):
+    grid = {"reference": reference,
+            "settings": {"base": {"vrp_vol_points": [3.0, 5.0, 7.0], "sv_logvol_sd": 0.35},
+                         "calm": {"vrp_vol_points": [6.0, 8.0, 10.0]}, "wild": {"sv_logvol_sd": 0.6}},
+            "rule": {"brier_horizons": [21, 63, 126], "crps_horizons": [21, 63, 126], "crps_tolerance": 0.005,
+                     "coverage_horizons": [5, 10, 21, 63, 126], "coverage_range": [0.87, 0.94]}}
+    p = tmp_path / "grid.json"
+    p.write_text(json.dumps(grid), encoding="utf-8")
+    return p
+
+
+def test_engine_grid_runs_the_model_simulation_per_setting_within_start_and_end(tmp_path):
+    inputs = _inputs()
+    pd.to_pickle(inputs, tmp_path / "rating_inputs.pkl")
+    args = argparse.Namespace(paths=300, start="2019-01", end="2021-06", term_structure="flat", refresh=False,
+                              out=str(tmp_path), engine_grid=str(_grid_file(tmp_path)), only=["base", "calm"], tag="t")
+    br.run(args)
+    o = pd.read_csv(tmp_path / "engine_t.csv", parse_dates=["date"])
+    assert list(o["setting"].unique()) == ["base", "calm"]
+    assert o["date"].min() == pd.Timestamp("2019-01-31") and o["date"].max() == pd.Timestamp("2021-06-30")
+    assert not (tmp_path / "rating_backtest.txt").exists()          # the backtest's own outputs are left alone
+    text = (tmp_path / "engine_t.txt").read_text(encoding="utf-8")
+    assert "Brier score of the 20% dip" in text and "The rule picks:" in text and "30 month-ends 2019-01 .. 2021-06" in text
+
+    # the reference setting's rows are exactly the full backtest's model columns at the same origin
+    cfg = Config(n_paths=300, use_news=False, horizons=tuple(br.HORIZONS), rating_horizon=br.RATING_H,
+                 vrp_vol_points=(3.0, 5.0, 7.0), sv_logvol_sd=0.35)
+    d = br.build_daily(inputs, cfg)
+    pos = int(o["pos"].iloc[5])
+    full = br.run_origin(d, pos, br.inputs_at(d, pos, inputs, cfg, "flat", {}), cfg)
+    row = o[(o["setting"] == "base") & (o["pos"] == pos)].iloc[0]
+    for h in br.HORIZONS:
+        for k in (f"pit_{h}", f"crps_model_{h}", f"pred_dd20_{h}", f"real_dd20_{h}", f"in90_{h}"):
+            assert row[k] == pytest.approx(full[k], rel=1e-12), k
+    calm = o[o["setting"] == "calm"]
+    assert calm["pred_dd20_63"].mean() < o.loc[o["setting"] == "base", "pred_dd20_63"].mean()   # larger haircuts
+
+    args.only = ["calm"]                                           # the guardrails need the reference
+    with pytest.raises(SystemExit, match="reference setting"):
+        br.run(args)
+    args.only = ["nope"]
+    with pytest.raises(SystemExit, match="not in"):
+        br.run(args)
+
+
+def test_engine_grid_builds_each_settings_inputs_and_stops_before_simulating_without_outcomes(tmp_path):
+    pd.to_pickle(_inputs(), tmp_path / "rating_inputs.pkl")
+    grid = json.loads(_grid_file(tmp_path).read_text(encoding="utf-8"))
+    grid["settings"]["growth"] = {"long_run_real_eps_growth": Config().long_run_real_eps_growth + 0.01}
+    p = tmp_path / "grid.json"
+    p.write_text(json.dumps(grid), encoding="utf-8")
+    args = argparse.Namespace(paths=200, start="2020-01", end="2020-06", term_structure="flat", refresh=False,
+                              out=str(tmp_path), engine_grid=str(p), only=["base", "growth"], tag="g")
+    br.run(args)
+    o = pd.read_csv(tmp_path / "engine_g.csv")
+    base, growth = (o[o["setting"] == s].set_index("pos") for s in ("base", "growth"))
+    assert (growth["crps_model_126"] != base["crps_model_126"]).all()      # the override reaches the drift ...
+    assert (growth["pit_126"] <= base["pit_126"]).all() and (growth["pit_126"] < base["pit_126"]).any()   # ... upward
+
+    args.start, args.end = "2023-01", None                       # the data end in June 2023: no 6-month outcome
+    with pytest.raises(SystemExit, match="no month-end in the window has an outcome at 6M yet"):
+        br.run(args)
+
+
+def test_engine_rule_picks_the_lowest_brier_within_the_guardrails(tmp_path):
+    n = 60
+    real = (np.arange(n) % 5 == 0).astype(float)                    # a 20% dip at one origin in five
+    rule = json.loads(_grid_file(tmp_path).read_text(encoding="utf-8"))["rule"]
+
+    def rows(name, pred, crps=1.0, cov=0.9):
+        f = {"setting": name, "pos": np.arange(n) * 21, "date": pd.date_range("2000-01-31", periods=n, freq="ME")}
+        for h in br.HORIZONS:
+            f.update({f"pit_{h}": 0.5, f"in90_{h}": np.arange(n) < round(cov * n), f"in50_{h}": True,
+                      f"crps_model_{h}": crps, f"pred_dd20_{h}": pred, f"real_dd20_{h}": real})
+        return pd.DataFrame(f)
+
+    o = pd.concat([rows("ref", 0.35, cov=0.96), rows("closer", 0.25), rows("closest but wide", 0.2, cov=0.97),
+                   rows("closest but rougher", 0.2, crps=1.006), rows("worse", 0.5)], ignore_index=True)
+    t = br.engine_table(o, rule, "ref")
+    assert t.attrs["pick"] == "closer"
+    assert t.at["ref", "eligible"] and not t.at["ref", "g2_coverage"]          # the reference always counts
+    assert not t.at["closest but wide", "eligible"] and not t.at["closest but rougher", "eligible"]
+    assert t.at["closer", "brier_mean"] == pytest.approx(np.mean((0.25 - real) ** 2))
+    tie = pd.concat([rows("ref", 0.25), rows("same", 0.25)], ignore_index=True)
+    assert br.engine_table(tie, rule, "ref").attrs["pick"] == "ref"               # an exact tie keeps the reference
+    m, lo, hi = br.brier_diff(o, "closer", "ref", 63)
+    assert m == pytest.approx(np.mean((0.25 - real) ** 2 - (0.35 - real) ** 2)) and lo <= m <= hi
+    text = "\n".join(br.engine_report(o, {"rule": rule, "reference": "ref"}))
+    assert "The rule picks: closer" in text and "fails" in text
 
 
 # ---- R1-37: Shiller link discovery and download validation ---------------------------------
